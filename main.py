@@ -1,86 +1,92 @@
-# Replace with environment variables for deployment
-import os
 
+#h_API_key="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"
+
+# Replace with your actual API keys
 GEMINI_API_KEY = "AIzaSyDGWGa2bY4WiiNh0-zOvViq-KV003pKkwA"
 GOOGLE_API_KEY = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"
 GOOGLE_CSE_ID = "b418152f819ee4c59"
 HUGGINGFACE_API_KEY = "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"
-# Import pysqlite3 to override sqlite3
+
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+import os
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_community.llms import Ollama
-from langchain.prompts import PromptTemplate
-from langchain.chains import LLMChain
-import chromadb
-from chromadb import Client
-from datetime import datetime
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from sklearn.metrics.pairwise import cosine_similarity
-from googleapiclient.discovery import build
 import google.generativeai as genai
 import logging
-import wikipedia
 import requests
+import wikipedia
 import numpy as np
 import spacy
 import uuid
-import certifi
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from sklearn.metrics.pairwise import cosine_similarity
+from googleapiclient.discovery import build
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-import random
-import time
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import nltk
+from sklearn.metrics import confusion_matrix
 import asyncio
 import aiohttp
 from collections import defaultdict
+import chromadb
 
+# Download NLTK data
 nltk.download('vader_lexicon', quiet=True)
+nltk.download('punkt', quiet=True)
 
-# Initialize sentiment analyzer
-sid = SentimentIntensityAnalyzer()
+
+
+# Validate API keys
+if not all([GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_CSE_ID, HUGGINGFACE_API_KEY]):
+    raise ValueError("Missing one or more API keys in environment variables")
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Initialize FastAPI app
 app = FastAPI()
 
-# Initialize models
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-    nlp = spacy.load('en_core_web_sm')
-except Exception as e:
-    logger.error(f"Failed to initialize models: {str(e)}")
-    model = cross_encoder = nlp = None
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Adjust for production (e.g., specific frontend URL)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Initialize ChromaDB Ephemeral Client (cloud-friendly, no persistent storage)
-try:
-    chroma_client = chromadb.EphemeralClient()
-    logger.info("ChromaDB initialized with ephemeral storage (in-memory)")
-except Exception as e:
-    logger.error(f"Failed to initialize ChromaDB: {str(e)}")
-    chroma_client = None
+# Initialize models
+model = SentenceTransformer('all-MiniLM-L6-v2')
+cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+nlp = spacy.load('en_core_web_sm')
+sid = SentimentIntensityAnalyzer()
+
+# Initialize ChromaDB (in-memory for simplicity; consider hosted solution for production)
+chroma_client = chromadb.Client()
+logger.info("ChromaDB initialized in-memory")
 
 # API configurations
 genai.configure(api_key=GEMINI_API_KEY)
 HF_API_URL = "https://api-inference.huggingface.co/models/mixtralai/Mixtral-8x7B-Instruct-v0.1"
 
 # RL configurations
-epsilon = 0.1  # Initial exploration rate
-alpha = 0.1    # Learning rate
-gamma = 0.9    # Discount factor
-q_table = defaultdict(lambda: {"use_agent": 0.0, "use_google": 0.0, "use_wiki": 0.0, "use_gemini": 0.0, "use_hf": 0.0, "use_enhanced": 0.0})
+epsilon = 0.1
+alpha = 0.1
+gamma = 0.9
+q_table = defaultdict(lambda: {"use_agent": 0.0, "use_google": 0.0, "use_wiki": 0.0, "use_gemini": 0.0, "use_hf": 0.0})
 response_cache = {}
 question_history = defaultdict(lambda: {"count": 0, "responses": []})
 query_counter = 0
 
-# Define keywords (unchanged)
+# Define keywords
 ai_keywords = [
     "ai", "machine learning", "neural network", "deep learning", "artificial intelligence",
     "data science", "nlp", "natural language processing", "computer vision", "chatbot",
@@ -206,21 +212,20 @@ base_urls = [
     "https://www.concordia.ca/gradstudies/students/new.html"
 ]
 
-# Initialize Ollama LLM (optional for cloud deployment)
+# Initialize Ollama LLM
 try:
-    ollama_llm = Ollama(model="llama3.2:1b", base_url=os.getenv("OLLAMA_URL","http://localhost:11434"), timeout=120)
+    ollama_llm = Ollama(model="llama3", base_url="http://localhost:11434", timeout=60)
     logger.info("Ollama LLM initialized successfully.")
 except Exception as e:
-    logger.warning(f"Failed to initialize Ollama: {str(e)}. Proceeding without Ollama.")
+    logger.error(f"Failed to initialize Ollama: {str(e)}")
     ollama_llm = None
 
-from langchain_core.runnables import RunnableSequence
-
+# Define Agents
 def create_agent(template):
     if ollama_llm is None:
-        return lambda history, query: "Sorry, the language model service is currently unavailable. I’ll provide a basic response instead."
+        return lambda history, query: "Error: Language model is not available."
     prompt = PromptTemplate(input_variables=["history", "query", "ai_keywords", "general_keywords", "admission_keywords", "base_urls"], template=template)
-    return prompt | ollama_llm
+    return LLMChain(llm=ollama_llm, prompt=prompt)
 
 general_agent = create_agent(
     "You are a general-purpose assistant focused solely on everyday topics like {general_keywords}, excluding AI or admissions-related content unless explicitly asked. Ignore any prior context that suggests a different role. Conversation history: {history}\n\n"
@@ -243,6 +248,10 @@ admission_agent = create_agent(
     "If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."
 )
 
+# Simulated agent (replacing Ollama)
+def simulate_agent_response(query, history, topic):
+    return f"Simulated response for {query} based on {topic}. History: {history[:50]}..."
+
 class Query(BaseModel):
     user_id: str
     query: str
@@ -253,32 +262,26 @@ class Feedback(BaseModel):
 
 def get_state(query, topic):
     global query_counter
-    doc = nlp(query) if nlp else None
-    entities = len(doc.ents) if doc else 0
+    doc = nlp(query)
+    entities = len(doc.ents)
     query_counter += 1
     return f"{topic}_{entities}_{query_counter}"
 
 async def fetch_google_search_response(query):
     try:
-        keywords = extract_keywords(query)
-        logger.info(f"Searching Google with keywords: {keywords}")
         service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
-        res = service.cse().list(q=keywords, cx=GOOGLE_CSE_ID, num=3).execute()
+        res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=3).execute()
         snippets = [item['snippet'] for item in res.get('items', [])]
-        response = " ".join(snippets) if snippets else "I am not able to answer this question based on Google search results."
-        return response if is_response_relevant(query, response, "") >= 0.55 else "I am not able to answer this question based on Google search results."
+        return " ".join(snippets) if snippets else "I am not able to answer this question based on Google search results."
     except Exception as e:
         logger.error(f"Google search error: {str(e)}")
         return "I am not able to answer this question due to a search error."
 
 async def fetch_wikipedia_response(query):
     try:
-        keywords = extract_keywords(query)
-        logger.info(f"Searching Wikipedia with keywords: {keywords}")
         wikipedia.set_lang("en")
-        summary = wikipedia.summary(keywords, sentences=10, auto_suggest=True)
-        response = f"{summary}" if summary else "I am not able to answer this question based on Wikipedia."
-        return response if is_response_relevant(query, response, "") >= 0.55 else "I am not able to answer this question based on Wikipedia."
+        summary = wikipedia.summary(query, sentences=10, auto_suggest=True)
+        return summary if summary else "I am not able to answer this question based on Wikipedia."
     except Exception as e:
         logger.error(f"Wikipedia error: {str(e)}")
         return "I am not able to answer this question due to a Wikipedia error."
@@ -287,9 +290,7 @@ async def fetch_gemini_response(query):
     try:
         gemini_model = genai.GenerativeModel('gemini-1.5-flash')
         response = gemini_model.generate_content(query)
-        text = response.text.strip()
-        enhanced_response = f"{text}"
-        return enhanced_response if is_response_relevant(query, enhanced_response, "") >= 0.55 else "I am not able to answer this question using Gemini."
+        return response.text.strip() if response.text else "I am not able to answer this question using Gemini."
     except Exception as e:
         logger.error(f"Gemini error: {str(e)}")
         return "I am not able to answer this question due to a Gemini error."
@@ -299,53 +300,66 @@ async def fetch_huggingface_response(query):
     payload = {"inputs": query, "parameters": {"max_length": 200, "temperature": 0.7}}
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.post(HF_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as response:
+            async with session.post(HF_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     result = await response.json()
-                    if isinstance(result, list) and result and "generated_text" in result[0]:
-                        text = str(result[0]["generated_text"])
-                        return text if is_response_relevant(query, text, "") >= 0.55 else "I am not able to answer this question using Hugging Face."
-                    return "I am not able to answer this question."
+                    return result[0]["generated_text"] if isinstance(result, list) and "generated_text" in result[0] else "I am not able to answer this question using Hugging Face."
                 return f"API error: Status {response.status}"
         except Exception as e:
             logger.error(f"Hugging Face error: {str(e)}")
             return "I am not able to answer this question due to a Hugging Face error."
 
 def is_response_relevant(query, response, history):
-    if not model or not cross_encoder:
-        return 0.5  # Fallback if models are unavailable
     try:
         if not response or not response.strip():
             return 0.0
         score = cross_encoder.predict([[query, response]])[0]
-        if history and history != "No previous conversation.":
-            history_score = cross_encoder.predict([[history, response]])[0]
-            score = 0.7 * score + 0.3 * history_score
         return min(1.0, max(0.0, float(score)))
     except Exception as e:
         logger.error(f"Error checking relevance: {str(e)}")
-        return 0.5
+        return 0.0
 
-def extract_keywords(query):
-    if not nlp:
-        return query
-    doc = nlp(query.lower())
-    keywords = [token.text for token in doc if token.pos_ in ["NOUN", "VERB", "PROPN"] and not token.is_stop]
-    return " ".join(keywords) or query
+def detect_topic(query):
+    # Simplified topic detection without Ollama
+    query_lower = query.lower()
+    if any(kw in query_lower for kw in ai_keywords):
+        return "AI"
+    elif any(kw in query_lower for kw in admission_keywords):
+        return "Admissions"
+    return "General"
 
 def select_agent_and_get_response(query, user_id):
-    topic = detect_topic_with_ollama(query, user_id)
-    logger.info(f"Detected topic for query '{query}' with user_id '{user_id}': {topic}")
+    topic = detect_topic(query)
     history = retrieve_history(user_id)
-    if topic == "Admissions" or "concordia" in query.lower():
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "Admissions" in entry or "concordia" in entry.lower()]) or "No relevant previous conversation."
-        return admission_agent, "Admissions Agent", filtered_history
-    elif topic == "AI":
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "AI" in entry]) or "No relevant previous conversation."
-        return ai_agent, "AI Agent", filtered_history
-    else:
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "General" in entry or ("AI" not in entry and "Admissions" not in entry)]) or "No relevant previous conversation."
-        return general_agent, "General Agent", filtered_history
+    return simulate_agent_response, topic, history
+
+def retrieve_history(user_id, n=10):
+    try:
+        collection = chroma_client.get_or_create_collection(name="chat_history")
+        results = collection.get(where={"user_id": user_id})
+        documents = results.get("documents", [])[-n:]
+        return "\n\n".join(documents) or "No previous conversation."
+    except Exception as e:
+        logger.error(f"Error retrieving history: {str(e)}")
+        return "No previous conversation."
+
+# Simplified select_action for deployment
+async def select_action(state, query, history, topic, agent_response):
+    actions = ["use_agent", "use_gemini", "use_hf", "use_google", "use_wiki"]
+    if random.random() < epsilon:
+        tasks = [
+            ("use_agent", asyncio.create_task(asyncio.sleep(0, agent_response))),
+            ("use_gemini", fetch_gemini_response(query)),
+            ("use_hf", fetch_huggingface_response(query)),
+            ("use_google", fetch_google_search_response(query)),
+            ("use_wiki", fetch_wikipedia_response(query))
+        ]
+        for action, task in tasks:
+            response = await task
+            if "not able to answer" not in response.lower() and "error" not in response.lower():
+                return action
+        return "use_agent"
+    return max(q_table[state], key=q_table[state].get)
 
 def detect_topic_with_ollama(query, user_id):
     if ollama_llm is None:
@@ -402,8 +416,6 @@ def detect_topic_with_ollama(query, user_id):
         return "General"
 
 def retrieve_history(user_id, n=10):
-    if not chroma_client:
-        return "No previous conversation."
     try:
         collection = chroma_client.get_or_create_collection(name="chat_history")
         results = collection.get(where={"user_id": user_id})
@@ -418,8 +430,6 @@ def retrieve_history(user_id, n=10):
         return "No previous conversation."
 
 def retrieve_last_queries(user_id, n=10):
-    if not chroma_client:
-        return "No previous queries."
     try:
         collection = chroma_client.get_or_create_collection(name="chat_history")
         results = collection.get(where={"user_id": user_id})
@@ -434,9 +444,6 @@ def retrieve_last_queries(user_id, n=10):
         return "No previous queries."
 
 def store_interaction(user_id, query, response, agent_name, state, action, metrics, topic, follow_up):
-    if not chroma_client:
-        logger.warning("ChromaDB unavailable; interaction not stored.")
-        return str(uuid.uuid4())
     collection = chroma_client.get_or_create_collection(name="chat_history")
     doc_id = str(uuid.uuid4())
     try:
@@ -464,7 +471,7 @@ def store_interaction(user_id, query, response, agent_name, state, action, metri
         return doc_id
     except Exception as e:
         logger.error(f"Failed to store interaction: {str(e)}")
-        return doc_id  # Return ID anyway for consistency
+        raise
 
 def calculate_metrics(query, response, current_topic, history, ground_truth=None):
     start_time = time.time()
@@ -477,11 +484,6 @@ def calculate_metrics(query, response, current_topic, history, ground_truth=None
         performance_metrics["ground_truths"].append(1)
         performance_metrics["response_times"].append(time.time() - start_time)
         logger.info(f"Fallback/Error response - Predictions: 0, Ground Truth: 1")
-        return metrics
-
-    if not model:
-        metrics = {"accuracy": 0.5, "coherence": 0.5, "satisfaction": 0.5}
-        performance_metrics["response_times"].append(time.time() - start_time)
         return metrics
 
     query_embedding = model.encode([query])[0]
@@ -734,7 +736,6 @@ def benchmark_comparison(metrics):
         "coherence": "Pass" if metrics["coherence"] >= benchmarks["coherence"] else "Fail",
         "satisfaction": "Pass" if metrics["satisfaction"] >= benchmarks["satisfaction"] else "Fail"
     }
-
 @app.post("/chat/")
 async def chat(query: Query):
     try:
@@ -743,73 +744,29 @@ async def chat(query: Query):
         logger.info(f"Query from user {user_id}: {user_query}")
 
         history = retrieve_history(user_id)
-        session_length = len(history.split("\n\n")) + 1 if history != "No previous conversation." else 1
-        performance_metrics["total_conversations"] += 1
-        performance_metrics["active_users"].add(user_id)
-        performance_metrics["session_lengths"].append(session_length)
-
-        current_topic = detect_topic_with_ollama(user_query, user_id)
+        current_topic = detect_topic(user_query)
         state = get_state(user_query, current_topic)
-        agent, agent_name, filtered_history = select_agent_and_get_response(user_query, user_id)
-        agent_response = agent.invoke({
-            "history": filtered_history,
-            "query": user_query,
-            "ai_keywords": ", ".join(ai_keywords),
-            "general_keywords": ", ".join(general_keywords),
-            "admission_keywords": ", ".join(admission_keywords),
-            "base_urls": ", ".join(base_urls)
-        })
+        agent, topic, filtered_history = select_agent_and_get_response(user_query, user_id)
+        agent_response = agent(user_query, filtered_history, topic)
 
-        # Check for user correction in history
-        user_correction = None
-        if history != "No previous conversation.":
-            last_entry = history.split("\n\n")[-1]
-            if "No, " in last_entry and "User: " in last_entry:
-                user_correction = last_entry.split("User: ")[-1].strip()
-
-        response, action, original_action = await enhance_response(user_query, agent_response, filtered_history, state, current_topic, user_correction)
-
-        if response is None:
-            raise ValueError("Response generation failed unexpectedly")
-
-        ground_truth = test_data.get(user_query)
-        benchmark_response = benchmark_data.get(user_query)
-        metrics = calculate_metrics(user_query, response, current_topic, history, ground_truth=ground_truth)
+        response, action, _ = await enhance_response(user_query, agent_response, filtered_history, state, current_topic)
+        metrics = calculate_metrics(user_query, response, current_topic, filtered_history)
         
-        if "not able to answer" not in response.lower() and "error" not in response.lower():
-            performance_metrics["resolutions"] += 1
-
-        if ground_truth:
-            logger.info(f"Test Mode - Query: '{user_query}'")
-            logger.info(f"Generated Response: '{response}'")
-            logger.info(f"Ground Truth: '{ground_truth}'")
-            logger.info(f"Benchmark Response (Gemini): '{benchmark_response}'")
-            logger.info(f"Metrics: Accuracy={metrics['accuracy']:.2f}, Coherence={metrics['coherence']:.2f}, Satisfaction={metrics['satisfaction']:.2f}")
-            if benchmark_response:
-                benchmark_metrics = calculate_metrics(user_query, benchmark_response, current_topic, history, ground_truth=ground_truth)
-                logger.info(f"Benchmark Metrics: Accuracy={benchmark_metrics['accuracy']:.2f}, Coherence={benchmark_metrics['coherence']:.2f}, Satisfaction={benchmark_metrics['satisfaction']:.2f}")
-
-        follow_up_question = generate_follow_up_question(user_query, response, current_topic)
-        doc_id = store_interaction(user_id, user_query, response, agent_name, state, action, metrics, current_topic, follow_up_question)
+        doc_id = store_interaction(user_id, user_query, response, topic, state, action, metrics, current_topic, "Follow-up question")
         
         return {
-            "agent": agent_name,
-            "response": f"{response}\n\nWould you like to know more? How about: '{follow_up_question}'",
+            "agent": topic,
+            "response": response,
             "metrics": metrics,
-            "benchmark_comparison": benchmark_comparison(metrics),
             "doc_id": doc_id,
-            "topic": current_topic,
-            "follow_up_question": follow_up_question
+            "topic": current_topic
         }
     except Exception as e:
-        error_msg = f"Internal server error: {str(e)}"
-        logger.error(f"Error in chat endpoint: {error_msg}. Query: {user_query}, Action attempted: {action if 'action' in locals() else 'unknown'}", exc_info=True)
-        raise HTTPException(status_code=500, detail=error_msg)
-
+        logger.error(f"Error in chat endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
 @app.post("/feedback/")
 async def submit_feedback(feedback: Feedback):
-    if not chroma_client:
-        return {"message": "Feedback submission unavailable due to database error"}
     try:
         collection = chroma_client.get_or_create_collection(name="chat_history")
         results = collection.get(ids=[feedback.doc_id])
@@ -843,65 +800,36 @@ static_model_metrics = {
     "f1_score": 0.0
 }
 
-def compute_static_model_metrics():
-    global static_model_metrics
-    accuracies, coherences, satisfactions = [], [], []
-    y_true = []
-    y_pred = []
-    relevance_threshold = 0.65
-    
-    if not model:
-        logger.warning("Model unavailable; static metrics set to default.")
-        return
+def compute_evaluation_metrics():
+    if not performance_metrics["predictions"]:
+        logger.warning("No predictions available for metric computation")
+        return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0, "avg_response_time": 0.0, "resolution_rate": 0.0, "fallback_rate": 0.0}
 
-    for query, bot_response in test_data.items():
-        benchmark_response = benchmark_data.get(query, "")
-        if not benchmark_response:
-            logger.warning(f"No benchmark response for query: '{query}'")
-            continue
-        
-        try:
-            bot_embedding = model.encode([bot_response])[0]
-            benchmark_embedding = model.encode([benchmark_response])[0]
-            query_embedding = model.encode([query])[0]
-            
-            accuracy = max(0, cosine_similarity([bot_embedding], [benchmark_embedding])[0][0])
-            accuracies.append(accuracy)
-            
-            coherence = max(0, cosine_similarity([bot_embedding], [query_embedding])[0][0])
-            coherences.append(coherence)
-            
-            relevance = is_response_relevant(query, bot_response, "")
-            sentiment = sid.polarity_scores(bot_response)['compound']
-            satisfaction = min(1.0, max(0.0, 0.8 * relevance + 0.2 * sentiment))
-            satisfactions.append(satisfaction)
-            
-            true_label = 1 if cosine_similarity([query_embedding], [benchmark_embedding])[0][0] >= relevance_threshold else 0
-            pred_label = 1 if cosine_similarity([query_embedding], [bot_embedding])[0][0] >= relevance_threshold else 0
-            y_true.append(true_label)
-            y_pred.append(pred_label)
-            
-            logger.debug(f"Query: '{query}' - True: {true_label}, Pred: {pred_label}, Accuracy: {accuracy:.2f}")
-        
-        except Exception as e:
-            logger.error(f"Error processing query '{query}': {str(e)}")
-            continue
+    y_true = performance_metrics["ground_truths"]
+    y_pred = performance_metrics["predictions"]
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     
-    if accuracies:
-        static_model_metrics["accuracy"] = np.mean(accuracies).item()
-    if coherences:
-        static_model_metrics["coherence"] = np.mean(coherences).item()
-    if satisfactions:
-        static_model_metrics["satisfaction"] = np.mean(satisfactions).item()
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     
-    if y_true and y_pred:
-        static_model_metrics["precision"] = precision_score(y_true, y_pred, zero_division=0)
-        static_model_metrics["recall"] = recall_score(y_true, y_pred, zero_division=0)
-        static_model_metrics["f1_score"] = f1_score(y_true, y_pred, zero_division=0)
-    else:
-        logger.warning("No valid data for precision, recall, F1 calculation")
-    
-    logger.info(f"Static model metrics computed: {static_model_metrics}")
+    total_queries = performance_metrics["total_conversations"]
+    avg_response_time = sum(performance_metrics["response_times"]) / len(performance_metrics["response_times"]) if performance_metrics["response_times"] else 0.0
+    resolution_rate = performance_metrics["resolutions"] / total_queries if total_queries > 0 else 0.0
+    fallback_rate = performance_metrics["fallbacks"] / total_queries if total_queries > 0 else 0.0
+
+    logger.info(f"Confusion Matrix - TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
+    logger.info(f"Computed Metrics - Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1_score:.2f}, "
+                f"Response Time: {avg_response_time:.2f}, Resolution: {resolution_rate:.2%}, Fallback: {fallback_rate:.2%}")
+    return {
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+        "avg_response_time": avg_response_time,
+        "resolution_rate": resolution_rate,
+        "fallback_rate": fallback_rate
+    }
+
 
 compute_static_model_metrics()
 
@@ -936,7 +864,8 @@ async def get_evaluation_metrics():
     except Exception as e:
         logger.error(f"Error computing evaluation metrics: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to compute metrics: {str(e)}")
-
+    
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="localhost", port=int(os.getenv("PORT", 8000)))
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
