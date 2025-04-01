@@ -4,7 +4,6 @@ from datetime import datetime
 import numpy as np
 import os
 import logging
-from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # Set up logging
@@ -17,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Set page configuration
 st.set_page_config(page_title="Concordia Chatbot", page_icon=":robot_face:", layout="wide")
 
-# Apply custom CSS with minor enhancements
+# Apply custom CSS
 st.markdown(
     """
     <style>
@@ -107,54 +106,66 @@ st.markdown(
 )
 
 # Backend URL configuration
-BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
-if BACKEND_URL == "http://127.0.0.1:8000":
-    logger.warning("Using default BACKEND_URL. Consider setting an environment variable for production.")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+if "localhost" in BACKEND_URL or "0.0.0.0" in BACKEND_URL:
+    logger.warning("Using local BACKEND_URL. Set 'BACKEND_URL' environment variable for production.")
 
 # Initialize session state
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "feedback_submitted" not in st.session_state:
-    st.session_state.feedback_submitted = set()
-if "current_topic" not in st.session_state:
-    st.session_state.current_topic = None
-if "feedback_ratings" not in st.session_state:
-    st.session_state.feedback_ratings = {}
-if "follow_up_input" not in st.session_state:
-    st.session_state.follow_up_input = ""
-if "eval_metrics" not in st.session_state:
-    st.session_state.eval_metrics = None  # Cache evaluation metrics
+def initialize_session_state():
+    defaults = {
+        "history": [],
+        "feedback_submitted": set(),
+        "current_topic": None,
+        "feedback_ratings": {},
+        "follow_up_input": "",
+        "eval_metrics": None,
+        "sentence_model": None  # Lazy-loaded model
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# Initialize sentence transformer
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    logger.error(f"Failed to load SentenceTransformer: {str(e)}")
-    model = None
+initialize_session_state()
+
+# Lazy load SentenceTransformer
+def load_sentence_model():
+    if st.session_state.sentence_model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            st.session_state.sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("SentenceTransformer loaded successfully.")
+        except Exception as e:
+            logger.error(f"Failed to load SentenceTransformer: {str(e)}. Using string matching for topic similarity.")
+            st.session_state.sentence_model = False  # Indicate failure
+    return st.session_state.sentence_model
 
 def is_same_topic(prev_topic, current_topic):
-    if model is None or not prev_topic or not current_topic:
+    if not prev_topic or not current_topic:
         return False
-    try:
-        prev_embedding = model.encode([prev_topic])[0]
-        curr_embedding = model.encode([current_topic])[0]
-        similarity = cosine_similarity([prev_embedding], [curr_embedding])[0][0]
-        return similarity >= 0.8
-    except Exception as e:
-        logger.error(f"Error checking topic similarity: {str(e)}")
-        return False
+    model = load_sentence_model()
+    if model is False:  # Failed to load
+        return prev_topic.lower() == current_topic.lower()
+    elif model:
+        try:
+            prev_embedding = model.encode([prev_topic])[0]
+            curr_embedding = model.encode([current_topic])[0]
+            similarity = cosine_similarity([prev_embedding], [curr_embedding])[0][0]
+            return similarity >= 0.8
+        except Exception as e:
+            logger.error(f"Error checking topic similarity: {str(e)}. Falling back to string match.")
+            return prev_topic.lower() == current_topic.lower()
+    return prev_topic.lower() == current_topic.lower()
 
 def fetch_evaluation_metrics():
     try:
-        response = requests.get(f"{BACKEND_URL}/evaluation_metrics/", timeout=60)
+        response = requests.get(f"{BACKEND_URL}/evaluation_metrics/", timeout=120)
         response.raise_for_status()
         eval_metrics = response.json()
         st.session_state.eval_metrics = eval_metrics
         logger.info(f"Evaluation metrics fetched: {eval_metrics}")
-        #st.sidebar.write(f"Debug: Fetched metrics: {eval_metrics}")  # Temporary debug
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch evaluation metrics: {str(e)}")
-        st.session_state.eval_metrics = {  # Default dict        st.session_state.eval_metrics = {
+        st.session_state.eval_metrics = {
             "total_conversations": 0,
             "active_users": 0,
             "avg_session_length": 0.0,
@@ -175,20 +186,20 @@ def send_message(message, user_id="user"):
             response = requests.post(
                 f"{BACKEND_URL}/chat/",
                 json={"user_id": user_id, "query": message},
-                timeout=60
+                timeout=120
             )
             response.raise_for_status()
-            logger.info(f"Raw response from backend: {response.text}")
             data = response.json()
             required_fields = ["agent", "response", "metrics", "benchmark_comparison", "doc_id", "topic", "follow_up_question"]
             missing_fields = [field for field in required_fields if field not in data]
             if missing_fields:
-                raise ValueError(f"Missing required fields in response: {missing_fields}. Data: {data}")
+                raise ValueError(f"Missing required fields in response: {missing_fields}")
+            logger.info(f"Backend response: {data}")
             return data
     except requests.exceptions.Timeout:
         error_msg = "Request timed out. Please try again."
-        st.error(error_msg)
         logger.error(error_msg)
+        st.error(error_msg)
         return {
             "agent": "Error",
             "response": error_msg,
@@ -199,9 +210,9 @@ def send_message(message, user_id="user"):
             "follow_up_question": "Can you try again?"
         }
     except (requests.exceptions.RequestException, ValueError) as e:
-        error_msg = f"Backend error: {str(e)}"
-        st.error(error_msg)
+        error_msg = f"Failed to communicate with backend: {str(e)}"
         logger.error(error_msg)
+        st.error(error_msg)
         return {
             "agent": "Error",
             "response": error_msg,
@@ -278,33 +289,32 @@ if submit_button and user_input.strip():
     response_data = send_message(user_input.strip())
     
     new_topic = response_data.get("topic")
-    if st.session_state.current_topic and new_topic:
-        if not is_same_topic(st.session_state.current_topic, new_topic):
-            st.session_state.feedback_ratings[new_topic] = []
-        elif new_topic not in st.session_state.feedback_ratings:
-            st.session_state.feedback_ratings[new_topic] = []
+    if st.session_state.current_topic and new_topic and not is_same_topic(st.session_state.current_topic, new_topic):
+        st.session_state.feedback_ratings[new_topic] = []
+    elif new_topic and new_topic not in st.session_state.feedback_ratings:
+        st.session_state.feedback_ratings[new_topic] = []
 
-    response_text = response_data["response"]
-    if not isinstance(response_text, str) or response_text.strip().replace(".", "").replace("-", "").isdigit():
-        logger.error(f"Received invalid response: {response_text}")
-        response_text = "Error: Invalid response from backend. Please try again."
+    response_text = response_data.get("response", "No response received.")
+    if not isinstance(response_text, str):
+        logger.error(f"Invalid response type: {type(response_text)} - {response_text}")
+        response_text = "Error: Invalid response format from backend."
 
     st.session_state.history.append({
         "role": "bot",
-        "agent": response_data["agent"],
+        "agent": response_data.get("agent", "Unknown"),
         "message": response_text,
-        "metrics": response_data["metrics"],
-        "benchmark_comparison": response_data["benchmark_comparison"],
-        "doc_id": response_data["doc_id"],
+        "metrics": response_data.get("metrics", {"accuracy": 0.0, "coherence": 0.0, "satisfaction": 0.0}),
+        "benchmark_comparison": response_data.get("benchmark_comparison", {"accuracy": "Fail", "coherence": "Fail", "satisfaction": "Fail"}),
+        "doc_id": response_data.get("doc_id"),
         "timestamp": timestamp,
         "topic": new_topic,
-        "follow_up_question": response_data["follow_up_question"]
+        "follow_up_question": response_data.get("follow_up_question", "Can you tell me more?")
     })
     st.session_state.current_topic = new_topic
-    if response_data["doc_id"]:
+    if response_data.get("doc_id"):
         st.session_state.feedback_submitted.discard(response_data["doc_id"])
     st.session_state.follow_up_input = ""
-    fetch_evaluation_metrics()  # Refresh metrics after each query
+    fetch_evaluation_metrics()
     st.rerun()
 
 # Handle chat clearing
@@ -314,7 +324,7 @@ if clear_button:
     st.session_state.current_topic = None
     st.session_state.feedback_ratings = {}
     st.session_state.follow_up_input = ""
-    fetch_evaluation_metrics()  # Refresh metrics after clearing
+    fetch_evaluation_metrics()
     st.rerun()
 
 # Feedback for last response
@@ -337,7 +347,7 @@ if st.session_state.history and st.session_state.history[-1]["role"] == "bot":
                     response = requests.post(
                         f"{BACKEND_URL}/feedback/",
                         json={"doc_id": last_response["doc_id"], "rating": feedback},
-                        timeout=60
+                        timeout=120
                     )
                     response.raise_for_status()
                     data = response.json()
@@ -347,19 +357,13 @@ if st.session_state.history and st.session_state.history[-1]["role"] == "bot":
                     last_response["rating"] = feedback
                     current_topic = st.session_state.current_topic
                     if current_topic:
-                        if current_topic in st.session_state.feedback_ratings:
-                            st.session_state.feedback_ratings[current_topic].append(feedback)
-                        else:
-                            st.session_state.feedback_ratings[current_topic] = [feedback]
+                        st.session_state.feedback_ratings.setdefault(current_topic, []).append(feedback)
                     st.success("Feedback submitted successfully!")
                     logger.info(f"Feedback submitted for doc_id: {last_response['doc_id']}, rating: {feedback}")
+                    fetch_evaluation_metrics()
                     st.rerun()
-                except requests.exceptions.RequestException as e:
-                    error_msg = f"Feedback submission failed: {response.text if 'response' in locals() else str(e)}"
-                    st.error(error_msg)
-                    logger.error(error_msg)
-                except ValueError as e:
-                    error_msg = f"Feedback submission error: {str(e)}"
+                except (requests.exceptions.RequestException, ValueError) as e:
+                    error_msg = f"Feedback submission failed: {str(e)}"
                     st.error(error_msg)
                     logger.error(error_msg)
             else:
@@ -367,33 +371,26 @@ if st.session_state.history and st.session_state.history[-1]["role"] == "bot":
     elif last_response["agent"] == "Error":
         st.warning("Feedback unavailable due to an error in the last response.")
     else:
-        st.warning("Feedback unavailable: Unable to store this interaction on the server.")
+        st.warning("Feedback unavailable: No valid response ID.")
 
-# Display metrics in sidebar
-
-# Display metrics in sidebar
+# Sidebar: Metrics Display
 st.sidebar.header("Chatbot Performance Metrics")
 
-# Ensure eval_metrics uses the latest fetched data
-eval_metrics = st.session_state.eval_metrics
-if eval_metrics is None:  # Fallback if still None after fetch
-    eval_metrics = {
-        "total_conversations": 0,
-        "active_users": 0,
-        "avg_session_length": 0.0,
-        "avg_response_time": 0.0,
-        "resolution_rate": 0.0,
-        "fallback_rate": 0.0,
-        "accuracy": 0.0,
-        "coherence": 0.0,
-        "satisfaction": 0.0,
-        "precision": 0.0,
-        "recall": 0.0,
-        "f1_score": 0.0
-    }
-    logger.warning("Eval metrics not fetched yet, using defaults.")
+eval_metrics = st.session_state.eval_metrics or {
+    "total_conversations": 0,
+    "active_users": 0,
+    "avg_session_length": 0.0,
+    "avg_response_time": 0.0,
+    "resolution_rate": 0.0,
+    "fallback_rate": 0.0,
+    "accuracy": 0.0,
+    "coherence": 0.0,
+    "satisfaction": 0.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1_score": 0.0
+}
 
-# Display overall model performance (static)
 st.sidebar.markdown('<div class="metrics-header">Overall Model Performance</div>', unsafe_allow_html=True)
 st.sidebar.write(f"**Accuracy:** {eval_metrics['accuracy']:.2f}")
 st.sidebar.write(f"**Coherence:** {eval_metrics['coherence']:.2f}")
@@ -402,7 +399,6 @@ st.sidebar.write(f"**Precision:** {eval_metrics['precision']:.2f}")
 st.sidebar.write(f"**Recall:** {eval_metrics['recall']:.2f}")
 st.sidebar.write(f"**F1 Score:** {eval_metrics['f1_score']:.2f}")
 
-# Display operational metrics (dynamic)
 st.sidebar.markdown('<div class="metrics-header">Operational Metrics</div>', unsafe_allow_html=True)
 st.sidebar.write(f"**Total Conversations:** {eval_metrics['total_conversations']}")
 st.sidebar.write(f"**Active Users:** {eval_metrics['active_users']}")
@@ -411,33 +407,24 @@ st.sidebar.write(f"**Avg Response Time:** {eval_metrics['avg_response_time']:.2f
 st.sidebar.write(f"**Resolution Rate:** {eval_metrics['resolution_rate']:.2%}")
 st.sidebar.write(f"**Fallback Rate:** {eval_metrics['fallback_rate']:.2%}")
 
-# Session-specific metrics (dynamic)
 if st.session_state.history:
     bot_responses = [chat for chat in st.session_state.history if chat["role"] == "bot"]
     if bot_responses:
         if st.session_state.current_topic and len(bot_responses) > 1:
             topic_responses = [r for r in bot_responses if r.get("topic") == st.session_state.current_topic]
-            if topic_responses:
-                avg_accuracy = np.mean([float(r["metrics"]["accuracy"]) for r in topic_responses])
-                avg_coherence = np.mean([float(r["metrics"]["coherence"]) for r in topic_responses])
-                avg_satisfaction = np.mean([float(r["metrics"]["satisfaction"]) for r in topic_responses])
-            else:
-                latest = bot_responses[-1]["metrics"]
-                avg_accuracy = float(latest["accuracy"])
-                avg_coherence = float(latest["coherence"])
-                avg_satisfaction = float(latest["satisfaction"])
+            responses_to_use = topic_responses if topic_responses else [bot_responses[-1]]
         else:
-            latest = bot_responses[-1]["metrics"]
-            avg_accuracy = float(latest["accuracy"])
-            avg_coherence = float(latest["coherence"])
-            avg_satisfaction = float(latest["satisfaction"])
+            responses_to_use = [bot_responses[-1]]
+        
+        avg_accuracy = np.mean([float(r["metrics"]["accuracy"]) for r in responses_to_use])
+        avg_coherence = np.mean([float(r["metrics"]["coherence"]) for r in responses_to_use])
+        avg_satisfaction = np.mean([float(r["metrics"]["satisfaction"]) for r in responses_to_use])
 
         st.sidebar.markdown('<div class="metrics-header">Session Metrics</div>', unsafe_allow_html=True)
         st.sidebar.write(f"**Avg Accuracy:** {avg_accuracy:.2f}")
         st.sidebar.write(f"**Avg Coherence:** {avg_coherence:.2f}")
         st.sidebar.write(f"**Implicit Satisfaction:** {avg_satisfaction:.2f}")
 
-        # CSAT
         if st.session_state.current_topic in st.session_state.feedback_ratings:
             ratings = st.session_state.feedback_ratings[st.session_state.current_topic]
             if ratings:
@@ -453,6 +440,6 @@ if st.session_state.history:
             st.sidebar.markdown(f"**Current Topic:** {st.session_state.current_topic}")
 else:
     st.sidebar.write("No interactions yet.")
-    
+
 if __name__ == "__main__":
     st.write("Running Concordia Chatbot...")
