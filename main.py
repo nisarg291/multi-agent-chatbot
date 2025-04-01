@@ -6,10 +6,6 @@ GOOGLE_API_KEY = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"
 GOOGLE_CSE_ID = "b418152f819ee4c59"
 HUGGINGFACE_API_KEY = "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"
 # Import pysqlite3 to override sqlite3
-__import__('pysqlite3')
-import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_community.llms import Ollama
