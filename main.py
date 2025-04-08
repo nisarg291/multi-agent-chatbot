@@ -1,90 +1,84 @@
-
-#h_API_key="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"
-
 # Replace with your actual API keys
 GEMINI_API_KEY = "AIzaSyDGWGa2bY4WiiNh0-zOvViq-KV003pKkwA"
 GOOGLE_API_KEY = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"
 GOOGLE_CSE_ID = "b418152f819ee4c59"
-HUGGINGFACE_API_KEY = "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"
+HUGGINGFACE_API_KEY = "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"
 
-__import__('pysqlite3')
-import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-import os
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai
-import logging
-import requests
-import wikipedia
-import numpy as np
-import spacy
-import uuid
+from langchain_community.llms import Ollama
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from chromadb import Client
+import chromadb
+from datetime import datetime
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.metrics.pairwise import cosine_similarity
 from googleapiclient.discovery import build
+import google.generativeai as genai
+import logging
+import wikipedia
+import requests
+import numpy as np
+import spacy
+import uuid
+import certifi
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+import random
+import time
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import nltk
-from sklearn.metrics import confusion_matrix
 import asyncio
 import aiohttp
 from collections import defaultdict
-import chromadb
+import json
+import os
 
-# Download NLTK data
-nltk.download('vader_lexicon', quiet=True)
-nltk.download('punkt', quiet=True)
+nltk.download('vader_lexicon')
 
-
-
-# Validate API keys
-if not all([GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_CSE_ID, HUGGINGFACE_API_KEY]):
-    raise ValueError("Missing one or more API keys in environment variables")
+# Initialize sentiment analyzer
+sid = SentimentIntensityAnalyzer()
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize FastAPI app
 app = FastAPI()
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production (e.g., specific frontend URL)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Initialize models
 model = SentenceTransformer('all-MiniLM-L6-v2')
 cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 nlp = spacy.load('en_core_web_sm')
-sid = SentimentIntensityAnalyzer()
 
-# Initialize ChromaDB (in-memory for simplicity; consider hosted solution for production)
-chroma_client = chromadb.Client()
-logger.info("ChromaDB initialized in-memory")
+# Initialize ChromaDB Persistent Client
+CHROMA_DB_PATH = "./chroma_customer_db"
+chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+logger.info(f"ChromaDB initialized with persistent storage at {CHROMA_DB_PATH}")
 
 # API configurations
 genai.configure(api_key=GEMINI_API_KEY)
 HF_API_URL = "https://api-inference.huggingface.co/models/mixtralai/Mixtral-8x7B-Instruct-v0.1"
 
 # RL configurations
-epsilon = 0.1
-alpha = 0.1
-gamma = 0.9
-q_table = defaultdict(lambda: {"use_agent": 0.0, "use_google": 0.0, "use_wiki": 0.0, "use_gemini": 0.0, "use_hf": 0.0})
-response_cache = {}
+epsilon = 0.1  # Retained for potential future use
+alpha = 0.1    # Learning rate
+gamma = 0.9    # Discount factor
+q_table = defaultdict(lambda: {"use_agent": 0.0, "use_gemini": 0.0, "use_hf": 0.0})
 question_history = defaultdict(lambda: {"count": 0, "responses": []})
 query_counter = 0
+
+# Reward memory file
+REWARD_FILE = "reward_memory.json"
+if os.path.exists(REWARD_FILE):
+    with open(REWARD_FILE, "r") as f:
+        reward_memory = json.load(f)
+else:
+    reward_memory = {}
 
 # Define keywords
 ai_keywords = [
@@ -228,29 +222,25 @@ def create_agent(template):
     return LLMChain(llm=ollama_llm, prompt=prompt)
 
 general_agent = create_agent(
-    "You are a general-purpose assistant focused solely on everyday topics like {general_keywords}, excluding AI or admissions-related content unless explicitly asked. Ignore any prior context that suggests a different role. Conversation history: {history}\n\n"
-    "Answer clearly and concisely: {query}\n\n"
-    "If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.\n\n"
-    "If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."
+    """You are a general-purpose assistant focused solely on general domain, excluding AI or admissions-related content unless explicitly asked. Ignore any prior history that suggests a different topic than current query.
+    Answer clearly and concisely the given query : {query}
+    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
+    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
 )
 
 ai_agent = create_agent(
-    "You are an AI expert specializing only in artificial intelligence topics like {ai_keywords}. Ignore any prior context unrelated to AI. Conversation history: {history}\n\n"
-    "Provide a detailed, accurate answer about AI-related topics: {query}\n\n"
-    "If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.\n\n"
-    "If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."
+    """You are an AI expert specializing only in artificial intelligence topics. Ignore any prior history unrelated to AI.
+    Provide a detailed, accurate answer about AI-related topics: {query}.
+    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
+    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
 )
 
 admission_agent = create_agent(
-    "You are a Concordia University admissions advisor specializing only in admissions and program details like {admission_keywords}. Use {base_urls} for accurate info. Ignore any prior context unrelated to admissions. Conversation history: {history}\n\n"
-    "Answer accurately about admissions and program details: {query}\n\n"
-    "If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.\n\n"
-    "If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."
+    """You are a Concordia University admissions advisor specializing only in admissions and program details like {admission_keywords}. Use {base_urls} for accurate info. Ignore any prior context unrelated to admissions. Optional Conversation history: {history}
+    Answer accurately about admissions and program details: {query}
+    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
+    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
 )
-
-# Simulated agent (replacing Ollama)
-def simulate_agent_response(query, history, topic):
-    return f"Simulated response for {query} based on {topic}. History: {history[:50]}..."
 
 class Query(BaseModel):
     user_id: str
@@ -258,7 +248,7 @@ class Query(BaseModel):
 
 class Feedback(BaseModel):
     doc_id: str
-    rating: int
+    rating: int  # 1-5 scale
 
 def get_state(query, topic):
     global query_counter
@@ -267,32 +257,15 @@ def get_state(query, topic):
     query_counter += 1
     return f"{topic}_{entities}_{query_counter}"
 
-async def fetch_google_search_response(query):
-    try:
-        service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
-        res = service.cse().list(q=query, cx=GOOGLE_CSE_ID, num=3).execute()
-        snippets = [item['snippet'] for item in res.get('items', [])]
-        return " ".join(snippets) if snippets else "I am not able to answer this question based on Google search results."
-    except Exception as e:
-        logger.error(f"Google search error: {str(e)}")
-        return "I am not able to answer this question due to a search error."
-
-async def fetch_wikipedia_response(query):
-    try:
-        wikipedia.set_lang("en")
-        summary = wikipedia.summary(query, sentences=10, auto_suggest=True)
-        return summary if summary else "I am not able to answer this question based on Wikipedia."
-    except Exception as e:
-        logger.error(f"Wikipedia error: {str(e)}")
-        return "I am not able to answer this question due to a Wikipedia error."
-
 async def fetch_gemini_response(query):
     try:
         gemini_model = genai.GenerativeModel('gemini-1.5-flash')
         response = gemini_model.generate_content(query)
-        return response.text.strip() if response.text else "I am not able to answer this question using Gemini."
+        text = response.text.strip()
+        enhanced_response = f"{text}"
+        return enhanced_response if is_response_relevant(query, enhanced_response, "") >= 0.55 else "I am not able to answer this question using Gemini."
     except Exception as e:
-        logger.error(f"Gemini error: {str(e)}")
+        logger.error(f"error: {str(e)}")
         return "I am not able to answer this question due to a Gemini error."
 
 async def fetch_huggingface_response(query):
@@ -303,10 +276,13 @@ async def fetch_huggingface_response(query):
             async with session.post(HF_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     result = await response.json()
-                    return result[0]["generated_text"] if isinstance(result, list) and "generated_text" in result[0] else "I am not able to answer this question using Hugging Face."
+                    if isinstance(result, list) and result and "generated_text" in result[0]:
+                        text = str(result[0]["generated_text"])
+                        return text if is_response_relevant(query, text, "") >= 0.55 else "I am not able to answer this question using Hugging Face."
+                    return "I am not able to answer this question."
                 return f"API error: Status {response.status}"
         except Exception as e:
-            logger.error(f"Hugging Face error: {str(e)}")
+            logger.error(f"error: {str(e)}")
             return "I am not able to answer this question due to a Hugging Face error."
 
 def is_response_relevant(query, response, history):
@@ -314,52 +290,32 @@ def is_response_relevant(query, response, history):
         if not response or not response.strip():
             return 0.0
         score = cross_encoder.predict([[query, response]])[0]
+        if history and history != "No previous conversation.":
+            history_score = cross_encoder.predict([[history, response]])[0]
+            score = 0.7 * score + 0.3 * history_score
         return min(1.0, max(0.0, float(score)))
     except Exception as e:
         logger.error(f"Error checking relevance: {str(e)}")
         return 0.0
 
-def detect_topic(query):
-    # Simplified topic detection without Ollama
-    query_lower = query.lower()
-    if any(kw in query_lower for kw in ai_keywords):
-        return "AI"
-    elif any(kw in query_lower for kw in admission_keywords):
-        return "Admissions"
-    return "General"
+def extract_keywords(query):
+    doc = nlp(query.lower())
+    keywords = [token.text for token in doc if token.pos_ in ["NOUN", "VERB", "PROPN"] and not token.is_stop]
+    return " ".join(keywords) or query
 
 def select_agent_and_get_response(query, user_id):
-    topic = detect_topic(query)
+    topic = detect_topic_with_ollama(query, user_id)
+    logger.info(f"Detected topic for query '{query}' with user_id '{user_id}': {topic}")
     history = retrieve_history(user_id)
-    return simulate_agent_response, topic, history
-
-def retrieve_history(user_id, n=10):
-    try:
-        collection = chroma_client.get_or_create_collection(name="chat_history")
-        results = collection.get(where={"user_id": user_id})
-        documents = results.get("documents", [])[-n:]
-        return "\n\n".join(documents) or "No previous conversation."
-    except Exception as e:
-        logger.error(f"Error retrieving history: {str(e)}")
-        return "No previous conversation."
-
-# Simplified select_action for deployment
-async def select_action(state, query, history, topic, agent_response):
-    actions = ["use_agent", "use_gemini", "use_hf", "use_google", "use_wiki"]
-    if random.random() < epsilon:
-        tasks = [
-            ("use_agent", asyncio.create_task(asyncio.sleep(0, agent_response))),
-            ("use_gemini", fetch_gemini_response(query)),
-            ("use_hf", fetch_huggingface_response(query)),
-            ("use_google", fetch_google_search_response(query)),
-            ("use_wiki", fetch_wikipedia_response(query))
-        ]
-        for action, task in tasks:
-            response = await task
-            if "not able to answer" not in response.lower() and "error" not in response.lower():
-                return action
-        return "use_agent"
-    return max(q_table[state], key=q_table[state].get)
+    if topic == "Admissions" or "concordia" in query.lower():
+        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "Admissions" in entry or "concordia" in entry.lower()]) or "No relevant previous conversation."
+        return admission_agent, "Admissions Agent", filtered_history
+    elif topic == "AI":
+        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "AI" in entry]) or "No relevant previous conversation."
+        return ai_agent, "AI Agent", filtered_history
+    else:
+        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "General" in entry or ("AI" not in entry and "Admissions" not in entry)]) or "No relevant previous conversation."
+        return general_agent, "General Agent", filtered_history
 
 def detect_topic_with_ollama(query, user_id):
     if ollama_llm is None:
@@ -368,35 +324,14 @@ def detect_topic_with_ollama(query, user_id):
         history = retrieve_last_queries(user_id, n=5)
         prompt = PromptTemplate(
             input_variables=["query", "history", "ai_keywords", "admission_keywords", "general_keywords"],
-            template="You are an expert topic classifier with deep knowledge across domains. Analyze the following query and its conversation history to determine its main topic. Return only one topic from this list: ['AI', 'Admissions', 'General']. Output the topic name alone, with no explanation or extra text.\n\n"
-                     "Current query: {query}\n"
-                     "Conversation history (last 5 queries with topics, most recent first):\n{history}\n\n"
-                     "Optional keyword hints (use these as guidance, but rely on your understanding if keywords are absent):\n"
-                     "- AI topics (e.g., artificial intelligence, learning systems): {ai_keywords}\n"
-                     "- Admissions topics (e.g., university entry, programs): {admission_keywords}\n"
-                     "- General topics (e.g., everyday knowledge, miscellaneous): {general_keywords}\n\n"
-                     "Instructions:\n"
-                     "1. Interpret the query’s intent and subject matter using your knowledge. Choose the most likely topic based on what the query is about, even if no specific keywords are present.\n"
-                     "   - Example: 'How does a computer learn patterns?' → 'AI' (implies AI concepts like machine learning).\n"
-                     "   - Example: 'what is limited memory machines?' → 'AI' (implies AI concepts like Artificial Intelligence).\n"
-                     "   - Example: 'how to make mobile more smart and like human?' → 'AI' (implies AI concepts like Artificial Intelligence making mobile smart).\n"
-                     "   - Example: 'What’s the process to join a university?' → 'Admissions' (implies university admissions).\n"
-                     "   - Example: 'How do I fix my sink?' → 'General' (implies practical everyday knowledge).\n"
-                     "   - Example: 'what is tiger?' → 'General' (implies general knowledge about animal).\n"
-                     "   - Example: 'who is ceo of TCS?' → 'General' (implies genral knowledge like asking about company, contry or city details).\n"
-                     "   - Example: 'who is the pm of canada?' → 'General' (implies genral knowledge like asking about company, contry or city details).\n"
-                     "   - Example: 'What is machine learning?' → 'AI' (direct AI topic bcz machine learning keyword is matching).\n"
-                     "   - Example: 'How do I apply to Concordia?' → 'Admissions' (direct admissions topic).\n"
-                     "   - Example: 'what are benifits for specially able students in university?' → 'Admissions' (implis admissions topic as mention about students and unviersity but rember this is not keywords than also it is admission and here university means you can give informention regarding concordia unveristy).\n"
-                     "   - Example: 'What’s the weather like?' → 'General' (direct general topic).\n"
+            template="""Understand full user query and classify the user query into one of these categories more accurately: 
+            1. AI related - give 'AI'
+            2. Concordia University related or Admission related or concordia Student related - give 'Admission'
+            3. General domain except AI-related or Concordia university, student or admission related then- give 'General' 
 
-                     "2. If the query uses pronouns ('he', 'she', 'it', 'this', 'that') or vague references ('that thing'), check the history’s most recent topic and use it if it fits the context.\n"
-                     "   - Example: 'Tell me more about it' with history 'What is AI?' (AI) → 'AI'.\n"
-                     "   - Example: 'explain more in detail with history 'what is pyschology (General) → 'General' and you need to tell more about pyschology.\n"
-                     "   - Example: 'explain more in detail with history 'what is computer vision (AI) → 'AI' and you need to tell more about Computer vision.\n"
-                     "3. If you’re unsure or the query is too vague to classify, return 'General'.\n"
-                     "   - Example: 'who is nisarg adalja' → 'General' (General as implies asking about specific person or specific place, earth, material) "
-                     "4. Output exactly one of: 'AI', 'Admissions', 'General'."
+            Query: "{query}"
+
+            Provide your answer in one word format: Category"""
         )
         chain = LLMChain(llm=ollama_llm, prompt=prompt)
         response = chain.invoke({
@@ -421,10 +356,13 @@ def retrieve_history(user_id, n=10):
         results = collection.get(where={"user_id": user_id})
         documents = results.get("documents", [])
         metadatas = results.get("metadatas", [])
-        if len(documents) > n:
-            documents = documents[-n:]
-            metadatas = metadatas[-n:]
-        return "\n\n".join([f"User: {meta['query']}\nAgent: {meta['response']}" for meta in metadatas]) or "No previous conversation."
+        conversation_turns = []
+        for doc, meta in zip(documents[-n:], metadatas[-n:]):
+            conversation_turns.append(f"User: {doc}")
+            conversation_turns.append(f"{meta['agent']}: {meta['response']}")
+            conversation_turns.append(f"Topic: {meta['topic']}")
+        context = "\n".join(conversation_turns)
+        return context
     except Exception as e:
         logger.error(f"Error retrieving history: {str(e)}")
         return "No previous conversation."
@@ -435,21 +373,24 @@ def retrieve_last_queries(user_id, n=10):
         results = collection.get(where={"user_id": user_id})
         documents = results.get("documents", [])
         metadatas = results.get("metadatas", [])
-        if len(documents) > n:
-            documents = documents[-n:]
-            metadatas = metadatas[-n:]
-        return "\n".join([f"User: {meta['query']} (Topic: {meta['topic']})" for meta in metadatas]) or "No previous queries."
+        conversation_turns = []
+        for doc, meta in zip(documents[-n:], metadatas[-n:]):
+            conversation_turns.append(f"User: {doc}")
+            conversation_turns.append(f"{meta['agent']}: {meta['response']}")
+            conversation_turns.append(f"Topic: {meta['topic']}")
+        context = "\n".join(conversation_turns)
+        return context
     except Exception as e:
         logger.error(f"Error retrieving last queries: {str(e)}")
         return "No previous queries."
 
-def store_interaction(user_id, query, response, agent_name, state, action, metrics, topic, follow_up):
+def store_interaction(user_id, query, response, agent_name, state, action, metrics, topic, follow_up, reward=0.0):
     collection = chroma_client.get_or_create_collection(name="chat_history")
     doc_id = str(uuid.uuid4())
     try:
         collection.add(
             ids=[doc_id],
-            documents=[str(response)],
+            documents=[str(query)],
             metadatas=[{
                 "user_id": user_id,
                 "query": query,
@@ -460,18 +401,59 @@ def store_interaction(user_id, query, response, agent_name, state, action, metri
                 "coherence": float(metrics["coherence"]),
                 "accuracy": float(metrics["accuracy"]),
                 "satisfaction": float(metrics["satisfaction"]),
+                "reward": float(reward),  # Store reward (default 0 until feedback)
                 "topic": topic,
                 "follow_up": follow_up,
                 "timestamp": datetime.now().isoformat()
             }]
         )
-        if metrics["satisfaction"] > 0.3:
-            response_cache[(state, action)] = (response, q_table[state][action])
         logger.info(f"Interaction stored successfully with doc_id: {doc_id}")
+
+        # Log interaction to evaluation_log.txt with truncation handling
+        log_path = "evaluation_log.txt"
+        if not os.path.exists(log_path) or os.stat(log_path).st_size == 0:
+            with open(log_path, "w") as f:
+                f.write(
+                    "=== Concordia Multi-Agent Chatbot Evaluation Log ===\n"
+                    "Each entry includes the timestamp, user input, selected agent, response, and evaluation metrics.\n\n"
+                    "Metric Descriptions:\n"
+                    "- Accuracy: Measures how well the response includes expected keywords relevant to the topic.\n"
+                    "- Coherence: Measures how well the response connects with the user’s recent conversation history.\n"
+                    "- Reward: Calculated from user feedback (1-5 scale mapped to -1 to 1) or default 0 if no feedback.\n"
+                    "------------------------------------------------------------\n\n"
+                )
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        clean_response = str(response).replace("\n", " ").strip()
+        max_log_length = 200  # Max characters for response in log
+        if len(clean_response) > max_log_length:
+            clean_response = clean_response[:max_log_length] + " [TRUNCATED]"
+        log_entry = (
+            f"Timestamp   : {timestamp}\n"
+            f"User ID     : {user_id}\n"
+            f"Agent       : {agent_name}\n"
+            f"User Query  : {query}\n"
+            f"Response    : {clean_response}\n"
+            f"Accuracy    : {metrics['accuracy']}\n"
+            f"Coherence   : {metrics['coherence']}\n"
+            f"Reward      : {reward}\n"
+            "------------------------------------------------------------\n\n"
+        )
+        with open(log_path, "a") as f:
+            f.write(log_entry)
+
         return doc_id
     except Exception as e:
         logger.error(f"Failed to store interaction: {str(e)}")
         raise
+
+def check_prior_feedback(query):
+    query_key = query.strip().lower()
+    if query_key in reward_memory:
+        ratings = reward_memory[query_key]
+        avg_rating = sum(ratings) / len(ratings)
+        return avg_rating
+    return None
 
 def calculate_metrics(query, response, current_topic, history, ground_truth=None):
     start_time = time.time()
@@ -535,175 +517,126 @@ def calculate_metrics(query, response, current_topic, history, ground_truth=None
         "satisfaction": float(satisfaction)
     }
 
-async def select_action(state, query, history, topic, agent_response):
-    actions = ["use_agent", "use_google", "use_wiki", "use_gemini", "use_hf"]
-    
-    if random.random() < epsilon:
-        action_scores = {}
-        tasks = [
-            ("use_agent", asyncio.create_task(asyncio.sleep(0, str(agent_response.get('text', agent_response) if isinstance(agent_response, dict) else agent_response)))),
-            ("use_google", fetch_google_search_response(query)),
-            ("use_wiki", fetch_wikipedia_response(query)),
-            ("use_gemini", fetch_gemini_response(query)),
-            ("use_hf", fetch_huggingface_response(query))
-        ]
-        for action, task in tasks:
-            response = await task
-            if "not able to answer" not in str(response).lower() and "error" not in str(response).lower():
-                metrics = calculate_metrics(query, response, topic, history)
-                relevance = is_response_relevant(query, response, history)
-                score = (0.4 * relevance + 0.3 * metrics["accuracy"] + 0.3 * metrics["coherence"])
-                action_scores[action] = score
-            else:
-                action_scores[action] = 0.0
-
-        if action_scores:
-            best_action = max(action_scores, key=action_scores.get)
-            logger.info(f"Exploration: Selected {best_action} with score {action_scores[best_action]}")
-            return best_action
-        return "use_agent"
-    else:
-        best_action = max(q_table[state], key=q_table[state].get)
-        logger.info(f"Exploitation: Selected {best_action} with Q-value {q_table[state][best_action]}")
-        return best_action
-
-def compute_reward(metrics, is_corrected=False):
-    reward = 0.4 * metrics["accuracy"] + 0.3 * metrics["coherence"] + 0.3 * metrics["satisfaction"]
-    return reward + 0.2 if is_corrected else reward
+def compute_reward(rating):
+    # Map 1-5 rating to reward between -1 and 1
+    reward_map = {1: -1, 2: -0.5, 3: 0, 4: 0.5, 5: 1}
+    return reward_map.get(rating, 0)  # Default to 0 if invalid rating
 
 def update_q_value(state, action, reward):
     old_q = q_table[state][action]
     q_table[state][action] = (1 - alpha) * old_q + alpha * (reward + gamma * max(q_table[state].values()))
     logger.info(f"Updated Q-value for state '{state}', action '{action}': {q_table[state][action]}")
 
-async def enhance_response(query, agent_response, history, state, topic, user_correction=None):
-    global epsilon
-    question_history[query]["count"] += 1
-    
-    # Check for correction request
-    correction_requested = "correct the information" in query.lower() or "correct this" in query.lower()
-    is_follow_up = False
-    if history and history != "No previous conversation.":
-        last_query = history.split("\n\n")[-1].split("User: ")[-1].split("\n")[0]
-        last_response = history.split("\n\n")[-1].split("Agent: ")[-1]
-        follow_up_prompt = f"Would you like to know more? How about: '{query}'"
-        is_follow_up = follow_up_prompt in last_response
-
-    # Handle repeated queries
-    if question_history[query]["count"] > 1 and not correction_requested and not user_correction:
-        past_responses = question_history[query]["responses"]
-        action = await select_action(state, query, history, topic, agent_response)
-        response = f"Refined answer: {past_responses[-1]}\nUpdated with {action} data."
-        question_history[query]["responses"].append(response)
-        metrics = calculate_metrics(query, response, topic, history)
-        reward = compute_reward(metrics)
-        update_q_value(state, action, reward)
-        response_cache[(state, action)] = (response, q_table[state][action])
-        return response, action, action
-
-    # Handle correction request or user correction
-    if correction_requested or user_correction:
-        google_resp = await fetch_google_search_response(query)
-        gemini_resp = await fetch_gemini_response(query)
-        if user_correction:
-            correction_text = user_correction
-            if correction_text in google_resp or correction_text in gemini_resp:
-                response = f"Corrected: {correction_text} (verified by Google/Gemini)"
-                action = "use_enhanced"
-                metrics = calculate_metrics(query, response, topic, history)
-                reward = compute_reward(metrics, is_corrected=True)
-                update_q_value(state, action, reward)
-                response_cache[(state, action)] = (response, q_table[state][action])
-                question_history[query]["responses"].append(response)
-                return response, action, action
-            else:
-                response = f"Correction '{correction_text}' not verified by Google/Gemini. Here's the latest: {gemini_resp}"
-        else:
-            response = f"Updated info: {gemini_resp}\nSource: Gemini, verified by Google."
-        action = "use_gemini"
-        metrics = calculate_metrics(query, response, topic, history)
-        reward = compute_reward(metrics, is_corrected=True)
-        update_q_value(state, action, reward)
-        response_cache[(state, action)] = (response, q_table[state][action])
-        question_history[query]["responses"].append(response)
-        return response, action, action
-
-    # Standard response generation
-    action = await select_action(state, query, history, topic, agent_response)
-    logger.info(f"Selected action for state '{state}': {action}")
-
-    if (state, action) in response_cache and not is_follow_up:
-        cached_response, q_value = response_cache[(state, action)]
-        if q_value > 0 and isinstance(cached_response, str) and "not able to answer" not in cached_response.lower():
-            logger.info(f"Using cached response for state '{state}', action '{action}' with Q-value {q_value}")
-            question_history[query]["responses"].append(cached_response)
-            return cached_response, action, action
-
-    if action == "use_agent":
-        response_text = str(agent_response.get('text', agent_response) if isinstance(agent_response, dict) else agent_response)
-        relevance = is_response_relevant(query, response_text, history)
-        if "not able to answer" not in response_text.lower() and relevance >= 0.7:
-            question_history[query]["responses"].append(response_text)
-            return response_text, action, action
-
-    responses = {}
-    tasks = [
-        fetch_google_search_response(query),
-        fetch_wikipedia_response(query),
-        fetch_gemini_response(query),
-        fetch_huggingface_response(query)
+async def enhance_response(query, agent, agent_response, history, state, topic, user_id):
+    # Define negative keywords for response evaluation
+    negative_keywords = [
+        "i am not able to answer", "don't", "cannot", "could not find", 
+        "could not", "couldn't", "can't", "didn't", "did not", "unsure about"
     ]
-    results = await asyncio.gather(*tasks)
-    google_resp, wiki_resp, gemini_resp, hf_resp = results
-
-    if google_resp and "not able to answer" not in google_resp.lower() and "error" not in google_resp.lower():
-        google_metrics = calculate_metrics(query, google_resp, topic, history)
-        responses["google"] = (google_resp, google_metrics["accuracy"] + google_metrics["coherence"])
-    if wiki_resp and "not able to answer" not in wiki_resp.lower() and "error" not in wiki_resp.lower():
-        wiki_metrics = calculate_metrics(query, wiki_resp, topic, history)
-        responses["wiki"] = (wiki_resp, wiki_metrics["accuracy"] + wiki_metrics["coherence"])
     
-    best_web = max(responses.items(), key=lambda x: x[1][1], default=(None, 0)) if responses else (None, 0)
-    best_web_resp = best_web[0]
+    # Check prior feedback from reward_memory.json
+    prior_rating = check_prior_feedback(query)
+    action = "use_agent"
+    agent_response_text = str(agent_response.get('text', agent_response) if isinstance(agent_response, dict) else agent_response).lower()
+    has_negative_keywords = any(keyword in agent_response_text for keyword in negative_keywords)
 
-    if gemini_resp and "not able to answer" not in gemini_resp.lower() and "error" not in gemini_resp.lower():
-        gemini_metrics = calculate_metrics(query, gemini_resp, topic, history)
-        responses["gemini"] = (gemini_resp, gemini_metrics)
-    if hf_resp and "not able to answer" not in hf_resp.lower() and "error" not in hf_resp.lower():
-        hf_metrics = calculate_metrics(query, hf_resp, topic, history)
-        responses["hf"] = (hf_resp, hf_metrics)
+    # Check for cached similar responses using embeddings
+    collection = chroma_client.get_or_create_collection(name="chat_history")
+    query_embedding = model.encode([query])[0]
+    results = collection.get(where={"user_id": user_id})
+    if results["ids"]:
+        for idx, doc in enumerate(results["documents"]):
+            doc_embedding = model.encode([doc])[0]
+            similarity = cosine_similarity([query_embedding], [doc_embedding])[0][0]
+            if similarity > 0.9:  # High similarity threshold
+                metadata = results["metadatas"][idx]
+                if metadata["reward"] >= 0.5:  # Use if prior feedback is positive
+                    logger.info(f"Reusing cached response for similar query: {doc}")
+                    return metadata["response"], action, action, results["ids"][idx]
 
-    if "gemini" in responses and "hf" in responses:
-        gemini_score = 0.4 * responses["gemini"][1]["accuracy"] + 0.3 * responses["gemini"][1]["coherence"] + 0.3 * responses["gemini"][1]["satisfaction"]
-        hf_score = 0.4 * responses["hf"][1]["accuracy"] + 0.3 * responses["hf"][1]["coherence"] + 0.3 * responses["hf"][1]["satisfaction"]
-        final_resp = responses["gemini"][0] if gemini_score > hf_score else responses["hf"][0]
-        final_action = "use_gemini" if gemini_score > hf_score else "use_hf"
-    elif "gemini" in responses:
-        final_resp = gemini_resp
-        final_action = "use_gemini"
-    elif "hf" in responses:
-        final_resp = hf_resp
-        final_action = "use_hf"
-    elif best_web_resp:
-        final_resp = best_web_resp
-        final_action = "use_google" if best_web_resp == google_resp else "use_wiki"
+    # If prior rating >= 4, use cached response
+    if prior_rating and prior_rating >= 4:
+        results = collection.get(where={"query": query, "user_id": user_id})
+        if results["ids"]:
+            metadata = results["metadatas"][-1]  # Most recent match
+            return metadata["response"], action, action, results["ids"][-1]
+
+    # Check Q-table for action preference
+    q_values = q_table[state]
+    max_q_action = max(q_values, key=q_values.get)
+    use_fallback = has_negative_keywords or (prior_rating and prior_rating <= 2)
+
+    if use_fallback:
+        logger.info(f"Initial Ollama response negative or low-rated ({prior_rating}): {agent_response_text}. Attempting regeneration.")
+        
+        # Retry with Ollama agent using a modified prompt
+        retry_prompt = f"Please provide a more detailed or different explanation for: {query}"
+        agent_response_retry = agent.invoke({
+            "history": history,
+            "query": retry_prompt,
+            "ai_keywords": ", ".join(ai_keywords),
+            "general_keywords": ", ".join(general_keywords),
+            "admission_keywords": ", ".join(admission_keywords),
+            "base_urls": ", ".join(base_urls)
+        })
+        retry_text = str(agent_response_retry.get('text', agent_response_retry) if isinstance(agent_response_retry, dict) else agent_response_retry).lower()
+        
+        if not any(keyword in retry_text for keyword in negative_keywords):
+            response = retry_text
+            action = "use_agent"
+            logger.info(f"Regenerated Ollama response successful: {response}")
+        else:
+            # Use Q-table to decide fallback
+            if q_values["use_gemini"] > q_values["use_agent"] + 0.2:
+                gemini_resp = await fetch_gemini_response(query)
+                gemini_resp_lower = gemini_resp.lower()
+                if not any(keyword in gemini_resp_lower for keyword in negative_keywords):
+                    response = gemini_resp
+                    action = "use_gemini"
+                    logger.info(f"Using Gemini response based on Q-table: {response}")
+                else:
+                    response = "I am not able to provide a satisfactory answer to this question."
+                    action = "use_agent"
+            elif q_values["use_hf"] > q_values["use_agent"] + 0.2:
+                hf_resp = await fetch_huggingface_response(query)
+                hf_resp_lower = hf_resp.lower()
+                if not any(keyword in hf_resp_lower for keyword in negative_keywords):
+                    response = hf_resp
+                    action = "use_hf"
+                    logger.info(f"Using Hugging Face response based on Q-table: {response}")
+                else:
+                    response = "I am not able to provide a satisfactory answer to this question."
+                    action = "use_agent"
+            else:
+                # Default fallback order if Q-values are inconclusive
+                gemini_resp = await fetch_gemini_response(query)
+                gemini_resp_lower = gemini_resp.lower()
+                if not any(keyword in gemini_resp_lower for keyword in negative_keywords):
+                    response = gemini_resp
+                    action = "use_gemini"
+                    logger.info(f"Using Gemini response: {response}")
+                else:
+                    hf_resp = await fetch_huggingface_response(query)
+                    hf_resp_lower = hf_resp.lower()
+                    if not any(keyword in hf_resp_lower for keyword in negative_keywords):
+                        response = hf_resp
+                        action = "use_hf"
+                        logger.info(f"Using Hugging Face response: {response}")
+                    else:
+                        response = "I am not able to provide a satisfactory answer to this question. Please try rephrasing or asking something else!"
+                        action = "use_agent"
+                        logger.info(f"All attempts failed. Final response: {response}")
     else:
-        final_resp = str(agent_response.get('text', agent_response) if isinstance(agent_response, dict) else agent_response)
-        final_action = "use_agent"
-        if "not able to answer" in final_resp.lower() or "error" in final_resp.lower():
-            final_resp = "I am not able to answer this question with current data. Try rephrasing or asking something else!"
-            final_action = "use_enhanced"
+        response = agent_response_text
 
-    question_history[query]["responses"].append(final_resp)
-    metrics = calculate_metrics(query, final_resp, topic, history)
-    reward = compute_reward(metrics)
-    update_q_value(state, final_action, reward)
-    response_cache[(state, final_action)] = (final_resp, q_table[state][final_action])
-    
-    # Dynamic epsilon decay
-    epsilon = max(0.01, epsilon * 0.99)
-    logger.info(f"Final response: {final_resp}, Action: {final_action}, Epsilon: {epsilon}")
-    return final_resp, final_action, action
+    # Calculate metrics and store the interaction
+    question_history[query]["responses"].append(response)
+    metrics = calculate_metrics(query, response, topic, history)
+    follow_up = ""  # Placeholder, updated later
+    doc_id = store_interaction(user_id, query, response, "Unknown", state, action, metrics, topic, follow_up, reward=0.0)
+
+    logger.info(f"Final response: {response}, Action: {action}")
+    return response, action, action, doc_id
 
 def generate_follow_up_question(query, response, topic):
     if ollama_llm is None:
@@ -736,6 +669,7 @@ def benchmark_comparison(metrics):
         "coherence": "Pass" if metrics["coherence"] >= benchmarks["coherence"] else "Fail",
         "satisfaction": "Pass" if metrics["satisfaction"] >= benchmarks["satisfaction"] else "Fail"
     }
+
 @app.post("/chat/")
 async def chat(query: Query):
     try:
@@ -744,27 +678,71 @@ async def chat(query: Query):
         logger.info(f"Query from user {user_id}: {user_query}")
 
         history = retrieve_history(user_id)
-        current_topic = detect_topic(user_query)
-        state = get_state(user_query, current_topic)
-        agent, topic, filtered_history = select_agent_and_get_response(user_query, user_id)
-        agent_response = agent(user_query, filtered_history, topic)
+        session_length = len(history.split("\n\n")) + 1 if history != "No previous conversation." else 1
+        performance_metrics["total_conversations"] += 1
+        performance_metrics["active_users"].add(user_id)
+        performance_metrics["session_lengths"].append(session_length)
 
-        response, action, _ = await enhance_response(user_query, agent_response, filtered_history, state, current_topic)
-        metrics = calculate_metrics(user_query, response, current_topic, filtered_history)
+        current_topic = detect_topic_with_ollama(user_query, user_id)
+        state = get_state(user_query, current_topic)
+        agent, agent_name, filtered_history = select_agent_and_get_response(user_query, user_id)
+        agent_response = agent.invoke({
+            "history": filtered_history,
+            "query": user_query,
+            "ai_keywords": ", ".join(ai_keywords),
+            "general_keywords": ", ".join(general_keywords),
+            "admission_keywords": ", ".join(admission_keywords),
+            "base_urls": ", ".join(base_urls)
+        })
+
+        response, action, original_action, doc_id = await enhance_response(user_query, agent, agent_response, filtered_history, state, current_topic, user_id)
+
+        if response is None:
+            raise ValueError("Response generation failed unexpectedly")
+
+        ground_truth = test_data.get(user_query)
+        benchmark_response = benchmark_data.get(user_query)
+        metrics = calculate_metrics(user_query, response, current_topic, history, ground_truth=ground_truth)
         
-        doc_id = store_interaction(user_id, user_query, response, topic, state, action, metrics, current_topic, "Follow-up question")
+        if "not able to answer" not in response.lower() and "error" not in response.lower():
+            performance_metrics["resolutions"] += 1
+
+        if ground_truth:
+            logger.info(f"Test Mode - Query: '{user_query}'")
+            logger.info(f"Generated Response: '{response}'")
+            logger.info(f"Ground Truth: '{ground_truth}'")
+            logger.info(f"Benchmark Response (Gemini): '{benchmark_response}'")
+            logger.info(f"Metrics: Accuracy={metrics['accuracy']:.2f}, Coherence={metrics['coherence']:.2f}, Satisfaction={metrics['satisfaction']:.2f}")
+            if benchmark_response:
+                benchmark_metrics = calculate_metrics(user_query, benchmark_response, current_topic, history, ground_truth=ground_truth)
+                logger.info(f"Benchmark Metrics: Accuracy={benchmark_metrics['accuracy']:.2f}, Coherence={benchmark_metrics['coherence']:.2f}, Satisfaction={benchmark_metrics['satisfaction']:.2f}")
+
+        follow_up_question = generate_follow_up_question(user_query, response, current_topic)
         
+        # Update interaction with user_id, agent_name, and follow_up
+        collection = chroma_client.get_or_create_collection(name="chat_history")
+        results = collection.get(ids=[doc_id])
+        if results["ids"]:
+            metadata = results["metadatas"][0]
+            metadata["user_id"] = user_id
+            metadata["agent"] = agent_name
+            metadata["follow_up"] = follow_up_question
+            collection.update(ids=[doc_id], metadatas=[metadata])
+
         return {
-            "agent": topic,
-            "response": response,
+            "agent": agent_name,
+            "response": f"{response}\n\nWould you like to know more? How about: '{follow_up_question}'",
             "metrics": metrics,
+            "benchmark_comparison": benchmark_comparison(metrics),
             "doc_id": doc_id,
-            "topic": current_topic
+            "topic": current_topic,
+            "follow_up_question": follow_up_question
         }
     except Exception as e:
-        logger.error(f"Error in chat endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-    
+        error_msg = f"Internal server error: {str(e)}"
+        logger.error(f"Error in chat endpoint: {error_msg}. Query: {user_query}, Action attempted: {action if 'action' in locals() else 'unknown'}", exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
 @app.post("/feedback/")
 async def submit_feedback(feedback: Feedback):
     try:
@@ -772,19 +750,50 @@ async def submit_feedback(feedback: Feedback):
         results = collection.get(ids=[feedback.doc_id])
         if not results["ids"]:
             raise HTTPException(status_code=404, detail="Interaction not found")
+        
         metadata = results["metadatas"][0]
+        query = metadata.get("query", "Unknown")
         response_text = metadata.get("response", results["documents"][0])
         rating = feedback.rating
+        
         if not 1 <= rating <= 5:
-            raise HTTPException(status_code=400, detail="Rating must be 1-5")
-        satisfaction = (rating - 1) / 4.0
-        metadata["satisfaction"] = float(satisfaction)
+            raise HTTPException(status_code=400, detail="Rating must be between 1 and 5")
+        
+        # Calculate reward from rating (1-5 scale mapped to -1 to 1)
+        reward = compute_reward(rating)
+        
+        # Update ChromaDB with new reward
+        metadata["reward"] = float(reward)
         collection.update(ids=[feedback.doc_id], metadatas=[metadata])
+        
+        # Update reward_memory.json
+        query_key = query.strip().lower()
+        if query_key not in reward_memory:
+            reward_memory[query_key] = []
+        reward_memory[query_key].append(rating)
+        with open(REWARD_FILE, "w") as f:
+            json.dump(reward_memory, f, indent=2)
+        
+        # Update Q-value
         state = metadata["state"]
         action = metadata["action"]
-        reward = {1: -1, 2: -0.5, 3: 0, 4: 0.5, 5: 1}[rating]
         update_q_value(state, action, reward)
-        logger.info(f"Feedback stored for doc_id: {feedback.doc_id}, rating: {rating}")
+        
+        # Log feedback to feedback_log.txt
+        feedback_log = "feedback_log.txt"
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(feedback_log, "a") as f:
+            f.write(
+                f"Timestamp: {timestamp}\n"
+                f"Doc ID: {feedback.doc_id}\n"
+                f"User ID: {metadata['user_id']}\n"
+                f"Query: {query}\n"
+                f"Rating (1-5): {rating}\n"
+                f"Reward: {reward}\n"
+                "------------------------------------------------------------\n\n"
+            )
+        
+        logger.info(f"Feedback stored for doc_id: {feedback.doc_id}, rating: {rating}, reward: {reward}")
         return {"message": "Feedback submitted successfully"}
     except Exception as e:
         logger.error(f"Error storing feedback: {str(e)}")
@@ -800,36 +809,61 @@ static_model_metrics = {
     "f1_score": 0.0
 }
 
-def compute_evaluation_metrics():
-    if not performance_metrics["predictions"]:
-        logger.warning("No predictions available for metric computation")
-        return {"precision": 0.0, "recall": 0.0, "f1_score": 0.0, "avg_response_time": 0.0, "resolution_rate": 0.0, "fallback_rate": 0.0}
-
-    y_true = performance_metrics["ground_truths"]
-    y_pred = performance_metrics["predictions"]
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+def compute_static_model_metrics():
+    global static_model_metrics
+    accuracies, coherences, satisfactions = [], [], []
+    y_true = []
+    y_pred = []
+    relevance_threshold = 0.65
     
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+    for query, bot_response in test_data.items():
+        benchmark_response = benchmark_data.get(query, "")
+        if not benchmark_response:
+            logger.warning(f"No benchmark response for query: '{query}'")
+            continue
+        
+        try:
+            bot_embedding = model.encode([bot_response])[0]
+            benchmark_embedding = model.encode([benchmark_response])[0]
+            query_embedding = model.encode([query])[0]
+            
+            accuracy = max(0, cosine_similarity([bot_embedding], [benchmark_embedding])[0][0])
+            accuracies.append(accuracy)
+            
+            coherence = max(0, cosine_similarity([bot_embedding], [query_embedding])[0][0])
+            coherences.append(coherence)
+            
+            relevance = is_response_relevant(query, bot_response, "")
+            sentiment = sid.polarity_scores(bot_response)['compound']
+            satisfaction = min(1.0, max(0.0, 0.8 * relevance + 0.2 * sentiment))
+            satisfactions.append(satisfaction)
+            
+            true_label = 1 if cosine_similarity([query_embedding], [benchmark_embedding])[0][0] >= relevance_threshold else 0
+            pred_label = 1 if cosine_similarity([query_embedding], [bot_embedding])[0][0] >= relevance_threshold else 0
+            y_true.append(true_label)
+            y_pred.append(pred_label)
+            
+            logger.debug(f"Query: '{query}' - True: {true_label}, Pred: {pred_label}, Accuracy: {accuracy:.2f}")
+        
+        except Exception as e:
+            logger.error(f"Error processing query '{query}': {str(e)}")
+            continue
     
-    total_queries = performance_metrics["total_conversations"]
-    avg_response_time = sum(performance_metrics["response_times"]) / len(performance_metrics["response_times"]) if performance_metrics["response_times"] else 0.0
-    resolution_rate = performance_metrics["resolutions"] / total_queries if total_queries > 0 else 0.0
-    fallback_rate = performance_metrics["fallbacks"] / total_queries if total_queries > 0 else 0.0
-
-    logger.info(f"Confusion Matrix - TP: {tp}, FP: {fp}, TN: {tn}, FN: {fn}")
-    logger.info(f"Computed Metrics - Precision: {precision:.2f}, Recall: {recall:.2f}, F1: {f1_score:.2f}, "
-                f"Response Time: {avg_response_time:.2f}, Resolution: {resolution_rate:.2%}, Fallback: {fallback_rate:.2%}")
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1_score": f1_score,
-        "avg_response_time": avg_response_time,
-        "resolution_rate": resolution_rate,
-        "fallback_rate": fallback_rate
-    }
-
+    if accuracies:
+        static_model_metrics["accuracy"] = np.mean(accuracies).item()
+    if coherences:
+        static_model_metrics["coherence"] = np.mean(coherences).item()
+    if satisfactions:
+        static_model_metrics["satisfaction"] = np.mean(satisfactions).item()
+    
+    if y_true and y_pred:
+        static_model_metrics["precision"] = precision_score(y_true, y_pred, zero_division=0)
+        static_model_metrics["recall"] = recall_score(y_true, y_pred, zero_division=0)
+        static_model_metrics["f1_score"] = f1_score(y_true, y_pred, zero_division=0)
+    else:
+        logger.warning("No valid data for precision, recall, F1 calculation")
+    
+    logger.info(f"Static model metrics computed: {static_model_metrics}")
 
 compute_static_model_metrics()
 
@@ -864,8 +898,3 @@ async def get_evaluation_metrics():
     except Exception as e:
         logger.error(f"Error computing evaluation metrics: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to compute metrics: {str(e)}")
-    
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
