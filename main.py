@@ -1,9 +1,8 @@
 
 # Replace with your actual API keys
-GEMINI_API_KEY = "AIzaSyDGWGa2bY4WiiNh0-zOvViq-KV003pKkwA"
-GOOGLE_API_KEY = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"
-GOOGLE_CSE_ID = "b418152f819ee4c59"
-HUGGINGFACE_API_KEY = "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"
+GEMINI_API_KEY = "copy_your_gemini_api_key_here"
+GOOGLE_API_KEY = "copy_your_google_key_here"
+GOOGLE_CSE_ID = "copy_your_google_cse_id_here"
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
