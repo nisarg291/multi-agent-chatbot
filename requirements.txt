@@ -1,4 +1,4 @@
-aiohttp==3.9.1
+aiohttp==3.11.0b0
 beautifulsoup4==4.12.2
 certifi==2023.7.22
 chromadb==0.4.24
