@@ -1,3 +1,4 @@
+
 # Replace with your actual API keys
 GEMINI_API_KEY = "AIzaSyDGWGa2bY4WiiNh0-zOvViq-KV003pKkwA"
 GOOGLE_API_KEY = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"
@@ -203,7 +204,9 @@ base_urls = [
     "https://www.concordia.ca/gradstudies/future-students/programs.html",
     "https://www.concordia.ca/gradstudies/future-students/how-to-apply.html",
     "https://www.concordia.ca/gradstudies/students/registration.html",
-    "https://www.concordia.ca/gradstudies/students/new.html"
+    "https://www.concordia.ca/gradstudies/students/new.html",
+    "https://www.concordia.ca/students/exams/schedule.html",
+    "https://www.concordia.ca/students/exams/important-dates.html"
 ]
 
 # Initialize Ollama LLM
@@ -222,25 +225,68 @@ def create_agent(template):
     return LLMChain(llm=ollama_llm, prompt=prompt)
 
 general_agent = create_agent(
-    """You are a general-purpose assistant focused solely on general domain, excluding AI or admissions-related content unless explicitly asked. Ignore any prior history that suggests a different topic than current query.
+    """You are a general-purpose assistant focused solely on general domain, excluding AI or admissions-related content unless explicitly asked. Ignore any prior history that suggests a different topic than current query. Conversation history: {history} \n
     Answer clearly and concisely the given query : {query}
-    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
-    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
+    If you are unsure, lack relevant data, or cannot answer or don't have answer respond with 'I am not able to answer this question'."""
 )
 
 ai_agent = create_agent(
-    """You are an AI expert specializing only in artificial intelligence topics. Ignore any prior history unrelated to AI.
+    """You are an AI expert specializing only in artificial intelligence topics. Ignore any prior history unrelated to AI. Conversation history: {history} \n
     Provide a detailed, accurate answer about AI-related topics: {query}.
-    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
-    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
+    If you are unsure, lack relevant data, or cannot answer or don't have answer respond with 'I am not able to answer this question'."""
 )
 
 admission_agent = create_agent(
-    """You are a Concordia University admissions advisor specializing only in admissions and program details like {admission_keywords}. Use {base_urls} for accurate info. Ignore any prior context unrelated to admissions. Optional Conversation history: {history}
+    """You are a Concordia University admissions advisor specializing only in admissions and program details like {admission_keywords}. Use {base_urls} for accurate info. Ignore any prior context unrelated to admissions. Conversation history: {history} \n
     Answer accurately about admissions and program details: {query}
-    If the query contains 'in X words' (e.g., 'in 50 words'), limit your response to approximately X words. If no word count is specified in the current query, provide the full response without limiting words.
-    If you are unsure, lack relevant data, or cannot answer, respond with 'I am not able to answer this question'."""
+    If you are unsure, lack relevant data, or cannot answer or don't have answer respond with 'I am not able to answer this question'."""
 )
+
+
+# ai_agent = create_agent(
+# """As an AI specialist, please help with the following query.
+
+#     Core AI topics for reference:
+#     {ai_keywords}
+
+#     Recent chat history:
+#     {history}
+
+#     User query: {query}
+
+#     Please provide a clear, technical, and helpful response."""
+# )
+
+# general_agent = create_agent(
+# """As a knowledgeable General assistant, please help with the following query:
+            
+#     Previous conversation:
+#     {history}
+
+#     User query: {query}
+
+#     Please provide a helpful and informative response.
+# """
+# )
+
+# admission_agent = create_agent(
+# """As a Concordia University Computer Science admission specialist, please help with the following query.
+
+#     Use the following context to provide accurate and relevant answers:
+
+#     Recent chat history:
+#     {history}
+
+#     refer the urls for more information:
+#     {base_urls}
+
+#     User query: {query}
+
+#     Please guide the prospective student based on the admission requirements.
+#     """
+# )
+
+
 
 class Query(BaseModel):
     user_id: str
@@ -257,42 +303,111 @@ def get_state(query, topic):
     query_counter += 1
     return f"{topic}_{entities}_{query_counter}"
 
-async def fetch_gemini_response(query):
+async def fetch_gemini_response(query, user_id):
     try:
         gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-        response = gemini_model.generate_content(query)
+        history=retrieve_history(user_id, 5)
+        new_query="give accurate response of the query based on your knowledge : \n"+query +"\n use below Recent chat history only for refrence : \n"+history+"\n"
+        response = gemini_model.generate_content(new_query)
         text = response.text.strip()
         enhanced_response = f"{text}"
+        logger.info(enhanced_response)
         return enhanced_response if is_response_relevant(query, enhanced_response, "") >= 0.55 else "I am not able to answer this question using Gemini."
     except Exception as e:
         logger.error(f"error: {str(e)}")
         return "I am not able to answer this question due to a Gemini error."
 
-async def fetch_huggingface_response(query):
-    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
-    payload = {"inputs": query, "parameters": {"max_length": 200, "temperature": 0.7}}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(HF_API_URL, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    if isinstance(result, list) and result and "generated_text" in result[0]:
-                        text = str(result[0]["generated_text"])
-                        return text if is_response_relevant(query, text, "") >= 0.55 else "I am not able to answer this question using Hugging Face."
-                    return "I am not able to answer this question."
-                return f"API error: Status {response.status}"
-        except Exception as e:
-            logger.error(f"error: {str(e)}")
-            return "I am not able to answer this question due to a Hugging Face error."
+async def fetch_google_search_response(query):
+    """
+    Fetches a response from Google Search using the Custom Search JSON API.
+    Returns the snippet of the first relevant result or a fallback message.
+    """
+    api_key = "AIzaSyBsEjEpJwJXUYcmJcEmgRwLvzfnMYg2n5A"  # Replace with your Google API key
+    cse_id = "b418152f819ee4c59"  # Replace with your Custom Search Engine ID
+    url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={cse_id}&q={query}&num=1"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if "items" in data and len(data["items"]) > 0:
+                        snippet = data["items"][0]["snippet"]
+                        # Clean up snippet (remove dates, extra whitespace, etc.)
+                        cleaned_response = " ".join(snippet.split())
+                        logger.info(f"Google Search response for '{query}': {cleaned_response}")
+                        return cleaned_response
+                    else:
+                        logger.warning(f"No Google Search results for query: {query}")
+                        return "Could not find a response from Google Search."
+                else:
+                    logger.error(f"Google Search API error: Status {resp.status}")
+                    return "Could not find a response from Google Search."
+    except Exception as e:
+        logger.error(f"Error fetching Google Search response for '{query}': {str(e)}")
+        return "Could not find a response from Google Search."
 
-def is_response_relevant(query, response, history):
+# Example usage (for testing)
+async def test_google_search():
+    response = await fetch_google_search_response("What is artificial intelligence?")
+    print(response)
+
+async def fetch_wikipedia_response(query):
+    """
+    Fetches a summary from Wikipedia for the given query.
+    Returns a relevant summary or a fallback message if no page is found.
+    """
+    try:
+        wikipedia.set_lang("en")
+        
+        # Modify query to target Concordia University’s main page for broader context
+        base_query = "Concordia University"
+        loop = asyncio.get_event_loop()
+        
+        # Search for relevant pages
+        search_results = await loop.run_in_executor(None, lambda: wikipedia.search(query))
+        if not search_results:
+            logger.warning(f"No Wikipedia search results for query: {query}")
+            return "Could not find a response from Wikipedia."
+        
+        # Use the original query if it’s specific, else default to "Concordia University"
+        wiki_query = query if "concordia" in query.lower() and "schedule" in query.lower() else base_query
+        summary = await loop.run_in_executor(None, lambda: wikipedia.summary(wiki_query, sentences=5))
+        
+        if summary:
+            # Check if the summary is relevant to exams or schedules
+            if "exam" in summary.lower() or "schedule" in summary.lower():
+                logger.info(f"Wikipedia response for '{query}': {summary}")
+                return summary
+            else:
+                logger.info(f"Wikipedia summary for '{query}' not exam-specific: {summary}")
+                return f"Wikipedia info: {summary} (Note: Specific exam schedules may not be available here; check Concordia’s official site.)"
+        else:
+            logger.warning(f"No Wikipedia summary for query: {query}")
+            return "Could not find a response from Wikipedia."
+    except wikipedia.exceptions.DisambiguationError as e:
+        logger.warning(f"Wikipedia disambiguation error for '{query}': {str(e)}")
+        return "Multiple Wikipedia entries found, please be more specific."
+    except wikipedia.exceptions.PageError:
+        logger.warning(f"Wikipedia page not found for query: {query}")
+        return "Could not find a response from Wikipedia."
+    except Exception as e:
+        logger.error(f"Error fetching Wikipedia response for '{query}': {str(e)}")
+        return "Could not find a response from Wikipedia."
+
+# Example usage (for testing)
+async def test_wikipedia():
+    response = await fetch_wikipedia_response("Artificial intelligence")
+    print(response)
+    
+def is_response_relevant(query, response, history=""):
     try:
         if not response or not response.strip():
             return 0.0
         score = cross_encoder.predict([[query, response]])[0]
         if history and history != "No previous conversation.":
             history_score = cross_encoder.predict([[history, response]])[0]
-            score = 0.7 * score + 0.3 * history_score
+            score = 0.9 * score + 0.1 * history_score
         return min(1.0, max(0.0, float(score)))
     except Exception as e:
         logger.error(f"Error checking relevance: {str(e)}")
@@ -306,16 +421,41 @@ def extract_keywords(query):
 def select_agent_and_get_response(query, user_id):
     topic = detect_topic_with_ollama(query, user_id)
     logger.info(f"Detected topic for query '{query}' with user_id '{user_id}': {topic}")
-    history = retrieve_history(user_id)
-    if topic == "Admissions" or "concordia" in query.lower():
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "Admissions" in entry or "concordia" in entry.lower()]) or "No relevant previous conversation."
-        return admission_agent, "Admissions Agent", filtered_history
-    elif topic == "AI":
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "AI" in entry]) or "No relevant previous conversation."
-        return ai_agent, "AI Agent", filtered_history
-    else:
-        filtered_history = "\n\n".join([entry for entry in history.split("\n\n") if "General" in entry or ("AI" not in entry and "Admissions" not in entry)]) or "No relevant previous conversation."
-        return general_agent, "General Agent", filtered_history
+    
+    # Retrieve raw history from ChromaDB
+    try:
+        collection = chroma_client.get_or_create_collection(name="chat_history")
+        results = collection.get(where={"user_id": user_id})
+        documents = results.get("documents", [])
+        metadatas = results.get("metadatas", [])
+        history=retrieve_history(user_id)
+        # Build conversation turns with topic filtering
+        conversation_turns = []
+        for doc, meta in zip(documents[-10:], metadatas[-10:]):  # Limit to last 10 turns, consistent with retrieve_history
+            turn = [
+                f"User: {doc}",
+                f"{meta['agent']}: {meta['response']}",
+                f"Topic: {meta['topic']}"
+            ]
+            conversation_turns.append("\n".join(turn))
+        
+        # Filter history based on detected topic
+        if topic == "Admissions" or "concordia" in query.lower():  # Note: Updated "Admission" to "Admissions" for consistency
+            filtered_turns = [turn for turn in conversation_turns if "Topic: Admissions" in turn]
+            filtered_history = "\n\n".join(filtered_turns) or "No relevant previous conversation."
+            return admission_agent, "Admissions Agent", history
+        elif topic == "AI":
+            filtered_turns = [turn for turn in conversation_turns if "Topic: AI" in turn]
+            filtered_history = "\n\n".join(filtered_turns) or "No relevant previous conversation."
+            return ai_agent, "AI Agent", history
+        else:  # General
+            filtered_turns = [turn for turn in conversation_turns if "Topic: General" in turn]
+            filtered_history = "\n\n".join(filtered_turns) or "No relevant previous conversation."
+            return general_agent, "General Agent", history
+    
+    except Exception as e:
+        logger.error(f"Error retrieving or filtering history: {str(e)}")
+        return general_agent, "General Agent", "No previous conversation."  # Default to general agent on error
 
 def detect_topic_with_ollama(query, user_id):
     if ollama_llm is None:
@@ -324,15 +464,39 @@ def detect_topic_with_ollama(query, user_id):
         history = retrieve_last_queries(user_id, n=5)
         prompt = PromptTemplate(
             input_variables=["query", "history", "ai_keywords", "admission_keywords", "general_keywords"],
-            template="""Understand full user query and classify the user query into one of these categories more accurately: 
+            # template=""" You are the expert in classifing the user queries into AI, Concordia/Admission related or General domain related
+            # Understand full user query and classify the user query into one of these categories more accurately. IF you dont understand the query or the query use keywords like it, this, that, above or previous. Than refer the Recent Chat History and return the last history topic: 
+
+            # Recent Chat History: 
+            # {history} 
+
+            # Query: 
+            # {query}
+            
+            # Instructions:
+            # 1. AI related - give 'AI'
+            # 2. Concordia University related or Admission related or concordia Student related - give 'Admission'
+            # 3. General domain except AI-related or Concordia university, student or admission related then- give 'General' 
+
+            # Provide your answer in one word format only: 'AI' or 'Admission' or 'General' """
+           template=""" You are the expert in classifing the user queries into AI, Concordia/Admission related or General domain related
+            Understand the following user query and classify the user query into one of these categories more accurately:
+
+            Query: 
+            {query}
+
+            
+            Instructions:
             1. AI related - give 'AI'
             2. Concordia University related or Admission related or concordia Student related - give 'Admission'
-            3. General domain except AI-related or Concordia university, student or admission related then- give 'General' 
+            3. If it is in continous to the previous topic like query used the keywords in queries like 'it', 'this', 'that' , 'above' or 'previous'. Than only refer the below recent chat history to understand context and return the Topic of the last chat history {history}. Other retur the Topic based on the Query itself.
+            4. General domain except AI-related or Concordia university, student or admission related then- give 'General' 
+           
+            
 
-            Query: "{query}"
 
-            Provide your answer in one word format: Category"""
-        )
+            Provide your answer in one word format only: 'AI' or 'Admission' or 'General' """
+         )
         chain = LLMChain(llm=ollama_llm, prompt=prompt)
         response = chain.invoke({
             "query": query.lower(),
@@ -341,16 +505,21 @@ def detect_topic_with_ollama(query, user_id):
             "admission_keywords": ", ".join(admission_keywords),
             "general_keywords": ", ".join(general_keywords)
         }).get('text', 'General').strip()
-        valid_topics = ['AI', 'Admissions', 'General']
-        if response in valid_topics:
-            return response
-        logger.warning(f"Invalid topic response '{response}' from LLM, defaulting to 'General'")
-        return "General"
+        valid_topics = ['AI', 'Admission', 'General']
+        if "AI" in response:
+            return "AI"
+        elif "Admission" in response:
+            return "Admission"
+        elif "General" in response:
+            return "General"
+        else:
+            logger.warning(f"Invalid topic response '{response}' from LLM, defaulting to 'General'")
+            return "General"
     except Exception as e:
         logger.error(f"Error detecting topic with Ollama: {str(e)}")
         return "General"
 
-def retrieve_history(user_id, n=10):
+def retrieve_history(user_id, n=20):
     try:
         collection = chroma_client.get_or_create_collection(name="chat_history")
         results = collection.get(where={"user_id": user_id})
@@ -367,7 +536,7 @@ def retrieve_history(user_id, n=10):
         logger.error(f"Error retrieving history: {str(e)}")
         return "No previous conversation."
 
-def retrieve_last_queries(user_id, n=10):
+def retrieve_last_queries(user_id, n=20):
     try:
         collection = chroma_client.get_or_create_collection(name="chat_history")
         results = collection.get(where={"user_id": user_id})
@@ -527,11 +696,10 @@ def update_q_value(state, action, reward):
     q_table[state][action] = (1 - alpha) * old_q + alpha * (reward + gamma * max(q_table[state].values()))
     logger.info(f"Updated Q-value for state '{state}', action '{action}': {q_table[state][action]}")
 
-async def enhance_response(query, agent, agent_response, history, state, topic, user_id):
+async def enhance_response(query, agent, agent_name, agent_response, history, state, topic, user_id):
     # Define negative keywords for response evaluation
     negative_keywords = [
-        "i am not able to answer", "don't", "cannot", "could not find", 
-        "could not", "couldn't", "can't", "didn't", "did not", "unsure about"
+        "not able to answer"
     ]
     
     # Check prior feedback from reward_memory.json
@@ -561,79 +729,78 @@ async def enhance_response(query, agent, agent_response, history, state, topic, 
             metadata = results["metadatas"][-1]  # Most recent match
             return metadata["response"], action, action, results["ids"][-1]
 
-    # Check Q-table for action preference
+    # Check Q-table for action preference (used later if needed)
     q_values = q_table[state]
-    max_q_action = max(q_values, key=q_values.get)
-    use_fallback = has_negative_keywords or (prior_rating and prior_rating <= 2)
+    use_fallback = prior_rating is not None and prior_rating <= 2  # Only regenerate if rating exists and is low
 
-    if use_fallback:
-        logger.info(f"Initial Ollama response negative or low-rated ({prior_rating}): {agent_response_text}. Attempting regeneration.")
-        
-        # Retry with Ollama agent using a modified prompt
-        retry_prompt = f"Please provide a more detailed or different explanation for: {query}"
-        agent_response_retry = agent.invoke({
-            "history": history,
-            "query": retry_prompt,
-            "ai_keywords": ", ".join(ai_keywords),
-            "general_keywords": ", ".join(general_keywords),
-            "admission_keywords": ", ".join(admission_keywords),
-            "base_urls": ", ".join(base_urls)
-        })
-        retry_text = str(agent_response_retry.get('text', agent_response_retry) if isinstance(agent_response_retry, dict) else agent_response_retry).lower()
-        
-        if not any(keyword in retry_text for keyword in negative_keywords):
-            response = retry_text
-            action = "use_agent"
-            logger.info(f"Regenerated Ollama response successful: {response}")
+    if use_fallback or has_negative_keywords:  # Fallback if low rating or negative response
+        if use_fallback:
+            logger.info(f"Initial response low-rated ({prior_rating}): {agent_response_text}. Attempting regeneration.")
         else:
-            # Use Q-table to decide fallback
-            if q_values["use_gemini"] > q_values["use_agent"] + 0.2:
-                gemini_resp = await fetch_gemini_response(query)
-                gemini_resp_lower = gemini_resp.lower()
-                if not any(keyword in gemini_resp_lower for keyword in negative_keywords):
-                    response = gemini_resp
-                    action = "use_gemini"
-                    logger.info(f"Using Gemini response based on Q-table: {response}")
-                else:
-                    response = "I am not able to provide a satisfactory answer to this question."
-                    action = "use_agent"
-            elif q_values["use_hf"] > q_values["use_agent"] + 0.2:
-                hf_resp = await fetch_huggingface_response(query)
-                hf_resp_lower = hf_resp.lower()
-                if not any(keyword in hf_resp_lower for keyword in negative_keywords):
-                    response = hf_resp
-                    action = "use_hf"
-                    logger.info(f"Using Hugging Face response based on Q-table: {response}")
-                else:
-                    response = "I am not able to provide a satisfactory answer to this question."
-                    action = "use_agent"
+            logger.info(f"Initial response negative: {agent_response_text}. Attempting fallback.")
+        
+        # Retry with Ollama agent using a modified prompt (only for low rating)
+        if use_fallback:
+            retry_prompt = f"Please provide a more detailed or different explanation for: {query}."
+            agent_response_retry = agent.invoke({
+                "history": history,
+                "query": retry_prompt,
+                "ai_keywords": ", ".join(ai_keywords),
+                "general_keywords": ", ".join(general_keywords),
+                "admission_keywords": ", ".join(admission_keywords),
+                "base_urls": ", ".join(base_urls)
+            })
+            retry_text = str(agent_response_retry.get('text', agent_response_retry) if isinstance(agent_response_retry, dict) else agent_response_retry).lower()
+            
+            if is_response_relevant(query,retry_text)>0.5:
+                response = retry_text
+                action = "use_agent"
+                logger.info(f"Regenerated Ollama response successful: {response}")
+                # Calculate metrics and store the interaction
             else:
-                # Default fallback order if Q-values are inconclusive
-                gemini_resp = await fetch_gemini_response(query)
-                gemini_resp_lower = gemini_resp.lower()
-                if not any(keyword in gemini_resp_lower for keyword in negative_keywords):
-                    response = gemini_resp
-                    action = "use_gemini"
-                    logger.info(f"Using Gemini response: {response}")
+                logger.info(f"Regenerated Ollama response still negative: {retry_text}. Trying Gemini.")
+        else:
+            retry_text = None  # Skip Ollama retry if only negative keywords triggered
+        
+        if has_negative_keywords or retry_text==None:
+            # Always try Gemini first
+            gemini_resp = await fetch_gemini_response(query, user_id)
+            gemini_resp_lower = gemini_resp.lower()
+            if is_response_relevant(query,gemini_resp_lower)>0.55:
+                response = gemini_resp
+                action = "use_gemini"
+                logger.info(f"Using Gemini response: {response}")
+            else:
+                # Try Google Search if Gemini fails
+                google_resp = await fetch_google_search_response(query)
+                google_resp_lower = google_resp.lower()
+                if is_response_relevant(query,google_resp_lower)>0.55:
+                    response = google_resp
+                    action = "use_google"
+                    logger.info(f"Using Google Search response: {response}")
                 else:
-                    hf_resp = await fetch_huggingface_response(query)
-                    hf_resp_lower = hf_resp.lower()
-                    if not any(keyword in hf_resp_lower for keyword in negative_keywords):
-                        response = hf_resp
-                        action = "use_hf"
-                        logger.info(f"Using Hugging Face response: {response}")
+                    # Try Wikipedia if Google fails
+                    wiki_resp = await fetch_wikipedia_response(query)
+                    wiki_resp_lower = wiki_resp.lower()
+                    if is_response_relevant(query,wiki_resp_lower)>0.55:
+                        response = wiki_resp
+                        action = "use_wikipedia"
+                        logger.info(f"Using Wikipedia response: {response}")
                     else:
                         response = "I am not able to provide a satisfactory answer to this question. Please try rephrasing or asking something else!"
                         action = "use_agent"
-                        logger.info(f"All attempts failed. Final response: {response}")
+                        logger.info(f"All attempts failed (Gemini: {gemini_resp_lower}, Google: {google_resp_lower}, Wiki: {wiki_resp_lower}). Final response: {response}")
+        
     else:
+        # Use initial agent response if no rating exists or rating > 2, and no negative keywords
         response = agent_response_text
+        logger.info(f"Using initial agent response: {response}")
 
     # Calculate metrics and store the interaction
     question_history[query]["responses"].append(response)
     metrics = calculate_metrics(query, response, topic, history)
     follow_up = ""  # Placeholder, updated later
-    doc_id = store_interaction(user_id, query, response, "Unknown", state, action, metrics, topic, follow_up, reward=0.0)
+    doc_id = store_interaction(user_id, query, response, agent_name, state, action, metrics, topic, follow_up, reward=0.0)
 
     logger.info(f"Final response: {response}, Action: {action}")
     return response, action, action, doc_id
@@ -695,7 +862,7 @@ async def chat(query: Query):
             "base_urls": ", ".join(base_urls)
         })
 
-        response, action, original_action, doc_id = await enhance_response(user_query, agent, agent_response, filtered_history, state, current_topic, user_id)
+        response, action, original_action, doc_id = await enhance_response(user_query, agent, agent_name, agent_response, filtered_history, state, current_topic, user_id)
 
         if response is None:
             raise ValueError("Response generation failed unexpectedly")
