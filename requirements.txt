@@ -4,7 +4,7 @@ certifi==2023.7.22
 chromadb==0.4.24
 fastapi==0.103.0 
 google-api-python-client==2.100.0 
-langchain-community==0.2.19 
+langchain-community==0.3.27 
 nltk==3.9.1 
 numpy==1.26.0 
 requests==2.31.0 
